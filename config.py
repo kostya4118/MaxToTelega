@@ -26,6 +26,7 @@ class Config:
     max_session: str
     mapping_db: str
     forward_groups: bool
+    mark_read: bool
 
     @classmethod
     def load(cls) -> "Config":
@@ -54,4 +55,5 @@ class Config:
             max_session=os.getenv("MAX_SESSION", "max_session.db").strip(),
             mapping_db=mapping_db,
             forward_groups=_bool(os.getenv("FORWARD_GROUPS"), default=False),
+            mark_read=_bool(os.getenv("MARK_READ"), default=True),
         )

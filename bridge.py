@@ -20,13 +20,19 @@ import logging
 import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import BufferedInputFile
+from aiogram.types import (
+    BufferedInputFile,
+    InputMediaPhoto,
+    InputMediaVideo,
+)
 from aiogram.types import Message as TgMessage
 
 from pymax import Client, File, Message, Photo, Video
 from pymax.types.domain import (
+    AudioAttachment,
     FileAttachment,
     PhotoAttachment,
+    StickerAttachment,
     VideoAttachment,
 )
 from pymax.types.domain.enums import ChatType
@@ -148,44 +154,87 @@ class Bridge:
         if message.text:
             body += f"\n{message.text}"
 
+        # Показываем активность, пока качаем и отправляем вложения.
+        await self.bot.send_chat_action(owner, "typing")
+
         media = await self._collect_incoming_media(message)
         sent_ids: list[int] = []
 
-        if not media:
+        # Подпись вешаем на первое отправленное; если она длиннее лимита —
+        # отправляем её отдельным текстовым сообщением.
+        caption: str | None = body
+        caption_used = False
+        if len(body) > TG_CAPTION_LIMIT:
             sent = await self.bot.send_message(owner, body)
             sent_ids.append(sent.message_id)
-        else:
-            # Подпись вешаем на первое медиа, если влезает; иначе шлём текст
-            # отдельным сообщением.
-            caption: str | None = body
-            if len(body) > TG_CAPTION_LIMIT:
-                sent = await self.bot.send_message(owner, body)
-                sent_ids.append(sent.message_id)
-                caption = None
+            caption = None
+            caption_used = True
 
-            for index, (kind, filename, data) in enumerate(media):
-                cap = caption if index == 0 else None
+        # Фото и видео объединяем в альбом (media group).
+        album = [m for m in media if m[0] in ("photo", "video")]
+        others = [m for m in media if m[0] not in ("photo", "video")]
+
+        if album:
+            cap = None if caption_used else caption
+            if len(album) == 1:
+                kind, filename, data = album[0]
                 file = BufferedInputFile(data, filename=filename)
                 if kind == "photo":
                     sent = await self.bot.send_photo(owner, file, caption=cap)
-                elif kind == "video":
-                    sent = await self.bot.send_video(owner, file, caption=cap)
                 else:
-                    sent = await self.bot.send_document(
-                        owner, file, caption=cap
-                    )
+                    sent = await self.bot.send_video(owner, file, caption=cap)
                 sent_ids.append(sent.message_id)
+            else:
+                group: list[InputMediaPhoto | InputMediaVideo] = []
+                for index, (kind, filename, data) in enumerate(album):
+                    file = BufferedInputFile(data, filename=filename)
+                    item_cap = cap if index == 0 else None
+                    if kind == "photo":
+                        group.append(InputMediaPhoto(media=file, caption=item_cap))
+                    else:
+                        group.append(InputMediaVideo(media=file, caption=item_cap))
+                msgs = await self.bot.send_media_group(owner, group)
+                sent_ids.extend(m.message_id for m in msgs)
+            caption_used = True
+
+        for kind, filename, data in others:
+            file = BufferedInputFile(data, filename=filename)
+            cap = None if caption_used else caption
+            if kind == "sticker":
+                # У стикеров нет подписи — если она ещё не показана, шлём текст.
+                if cap:
+                    pre = await self.bot.send_message(owner, cap)
+                    sent_ids.append(pre.message_id)
+                try:
+                    sent = await self.bot.send_sticker(owner, file)
+                except Exception:
+                    sent = await self.bot.send_document(owner, file)
+            elif kind == "audio":
+                sent = await self.bot.send_audio(owner, file, caption=cap)
+            else:
+                sent = await self.bot.send_document(owner, file, caption=cap)
+            sent_ids.append(sent.message_id)
+            caption_used = True
+
+        if not sent_ids:
+            sent = await self.bot.send_message(owner, body)
+            sent_ids.append(sent.message_id)
 
         # Запоминаем связь: ответ реплаем на любое из этих сообщений уйдёт в
-        # этот чат MAX.
+        # этот чат MAX (и отметит исходное сообщение прочитанным).
         assert self.storage is not None
         for mid in sent_ids:
-            await self.storage.remember(owner, mid, message.chat_id)
+            await self.storage.remember(
+                owner, mid, message.chat_id, message.id
+            )
 
     async def _collect_incoming_media(
         self, message: Message
     ) -> list[tuple[str, str, bytes]]:
-        """Скачивает вложения MAX. Возвращает список (kind, filename, bytes)."""
+        """Скачивает вложения MAX. Возвращает список (kind, filename, bytes).
+
+        kind ∈ {photo, video, document, sticker, audio}.
+        """
         result: list[tuple[str, str, bytes]] = []
         for attach in message.attaches:
             try:
@@ -193,17 +242,6 @@ class Bridge:
                     data = await self._download(attach.base_url)
                     if data:
                         result.append(("photo", "photo.jpg", data))
-
-                elif isinstance(attach, FileAttachment):
-                    info = await self.client.get_file_by_id(
-                        message.chat_id, message.id, attach.file_id
-                    )
-                    if info and info.url:
-                        data = await self._download(info.url)
-                        if data:
-                            result.append(
-                                ("file", attach.name or "file", data)
-                            )
 
                 elif isinstance(attach, VideoAttachment):
                     info = await self.client.get_video_by_id(
@@ -213,6 +251,28 @@ class Bridge:
                         data = await self._download(info.url)
                         if data:
                             result.append(("video", "video.mp4", data))
+
+                elif isinstance(attach, FileAttachment):
+                    info = await self.client.get_file_by_id(
+                        message.chat_id, message.id, attach.file_id
+                    )
+                    if info and info.url:
+                        data = await self._download(info.url)
+                        if data:
+                            result.append(
+                                ("document", attach.name or "file", data)
+                            )
+
+                elif isinstance(attach, StickerAttachment):
+                    data = await self._download(attach.url)
+                    if data:
+                        result.append(("sticker", "sticker.webp", data))
+
+                elif isinstance(attach, AudioAttachment):
+                    if attach.url:
+                        data = await self._download(attach.url)
+                        if data:
+                            result.append(("audio", "audio.mp3", data))
             except Exception:
                 logger.exception("Не удалось скачать вложение из MAX")
         return result
@@ -267,16 +327,17 @@ class Bridge:
 
     async def _send_to_max(self, message: TgMessage) -> None:
         assert self.storage is not None
-        max_chat_id = await self.storage.resolve(
+        resolved = await self.storage.resolve(
             message.chat.id, message.reply_to_message.message_id
         )
-        if max_chat_id is None:
+        if resolved is None:
             await message.reply(
                 "Не знаю, в какой чат MAX это отправить — отвечай реплаем "
                 "именно на пересланное мной сообщение."
             )
             return
 
+        max_chat_id, max_message_id = resolved
         text = message.text or message.caption or ""
         attachments = await self._collect_outgoing_media(message)
 
@@ -285,6 +346,16 @@ class Bridge:
             text=text,
             attachments=attachments or None,
         )
+
+        # Отмечаем исходное сообщение в MAX прочитанным.
+        if self.config.mark_read and max_message_id is not None:
+            try:
+                await self.client.read_message(
+                    message_id=max_message_id, chat_id=max_chat_id
+                )
+            except Exception:
+                logger.exception("Не удалось отметить сообщение прочитанным")
+
         await message.reply("✅ Отправлено в MAX")
 
     async def _collect_outgoing_media(
