@@ -27,7 +27,7 @@ from aiogram.types import (
 )
 from aiogram.types import Message as TgMessage
 
-from pymax import Client, File, Message, Photo, Video
+from pymax import Client, ExtraConfig, File, Message, Photo, Video
 from pymax.types.domain import (
     AudioAttachment,
     FileAttachment,
@@ -55,10 +55,19 @@ class Bridge:
         self.config = config
         self.bot = Bot(config.telegram_token)
         self.dp = Dispatcher()
+        # Прокси нужен, если сервер не в стране телефона — иначе MAX считает
+        # вход подозрительным (антифрод). Прокси используется и для TCP-входа,
+        # и для выгрузки вложений.
+        extra = (
+            ExtraConfig(proxy=config.max_proxy) if config.max_proxy else None
+        )
+        if config.max_proxy:
+            logger.info("MAX подключается через прокси")
         self.client = Client(
             phone=config.max_phone,
             work_dir=config.work_dir,
             session_name=config.max_session,
+            extra_config=extra,
         )
         self.storage: Storage | None = None
         self.http: aiohttp.ClientSession | None = None

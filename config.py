@@ -27,6 +27,7 @@ class Config:
     mapping_db: str
     forward_groups: bool
     mark_read: bool
+    max_proxy: str | None
 
     @classmethod
     def load(cls) -> "Config":
@@ -56,4 +57,5 @@ class Config:
             mapping_db=mapping_db,
             forward_groups=_bool(os.getenv("FORWARD_GROUPS"), default=False),
             mark_read=_bool(os.getenv("MARK_READ"), default=True),
+            max_proxy=(os.getenv("MAX_PROXY", "").strip() or None),
         )
