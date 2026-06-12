@@ -71,11 +71,29 @@ class Bridge:
     async def run(self) -> None:
         self.storage = await Storage.create(self.config.mapping_db)
         self.http = aiohttp.ClientSession()
+
+        # Две независимые задачи: MAX-клиент (вечный) и Telegram-поллинг
+        # (останавливается по SIGINT/SIGTERM — aiogram сам ставит обработчики).
+        # Как только ЛЮБАЯ из них завершается (сигнал на остановку или падение
+        # MAX-входа), гасим вторую и выходим — чтобы systemd не ждал SIGKILL.
+        client_task = asyncio.create_task(self.client.start(), name="max")
+        polling_task = asyncio.create_task(
+            self.dp.start_polling(self.bot), name="telegram"
+        )
         try:
-            await asyncio.gather(
-                self.client.start(),
-                self.dp.start_polling(self.bot),
+            done, pending = await asyncio.wait(
+                {client_task, polling_task},
+                return_when=asyncio.FIRST_COMPLETED,
             )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                exc = task.exception()
+                if exc is not None:
+                    logger.error(
+                        "Задача %s упала: %r", task.get_name(), exc
+                    )
         finally:
             await self.http.close()
             await self.storage.close()
