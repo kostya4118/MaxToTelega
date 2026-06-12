@@ -120,6 +120,18 @@ class Bridge:
                 return c.type != ChatType.DIALOG
         return False
 
+    def _chat_title_by_id(self, chat_id: int) -> str:
+        """Человекочитаемое имя чата MAX по его id."""
+        for c in self.client.chats or []:
+            if c.id == chat_id:
+                if c.type != ChatType.DIALOG and c.title:
+                    return c.title
+                # Личный диалог: показываем собеседника.
+                for uid in c.participants or {}:
+                    if uid != self._my_id():
+                        return self._user_name(uid)
+        return f"чат {chat_id}"
+
     # ── MAX -> Telegram ───────────────────────────────────────────────────
 
     def _register_max_handlers(self) -> None:
@@ -149,6 +161,10 @@ class Bridge:
         if self._is_group(message.chat_id) and not self.config.forward_groups:
             return
 
+        # Тихая доставка для заглушённых чатов (см. команды /mute, /unmute).
+        assert self.storage is not None
+        silent = await self.storage.is_muted(message.chat_id)
+
         header = self._chat_label(message)
         body = f"💬 {header}"
         if message.text:
@@ -165,7 +181,9 @@ class Bridge:
         caption: str | None = body
         caption_used = False
         if len(body) > TG_CAPTION_LIMIT:
-            sent = await self.bot.send_message(owner, body)
+            sent = await self.bot.send_message(
+                owner, body, disable_notification=silent
+            )
             sent_ids.append(sent.message_id)
             caption = None
             caption_used = True
@@ -180,9 +198,13 @@ class Bridge:
                 kind, filename, data = album[0]
                 file = BufferedInputFile(data, filename=filename)
                 if kind == "photo":
-                    sent = await self.bot.send_photo(owner, file, caption=cap)
+                    sent = await self.bot.send_photo(
+                        owner, file, caption=cap, disable_notification=silent
+                    )
                 else:
-                    sent = await self.bot.send_video(owner, file, caption=cap)
+                    sent = await self.bot.send_video(
+                        owner, file, caption=cap, disable_notification=silent
+                    )
                 sent_ids.append(sent.message_id)
             else:
                 group: list[InputMediaPhoto | InputMediaVideo] = []
@@ -193,7 +215,9 @@ class Bridge:
                         group.append(InputMediaPhoto(media=file, caption=item_cap))
                     else:
                         group.append(InputMediaVideo(media=file, caption=item_cap))
-                msgs = await self.bot.send_media_group(owner, group)
+                msgs = await self.bot.send_media_group(
+                    owner, group, disable_notification=silent
+                )
                 sent_ids.extend(m.message_id for m in msgs)
             caption_used = True
 
@@ -203,21 +227,33 @@ class Bridge:
             if kind == "sticker":
                 # У стикеров нет подписи — если она ещё не показана, шлём текст.
                 if cap:
-                    pre = await self.bot.send_message(owner, cap)
+                    pre = await self.bot.send_message(
+                        owner, cap, disable_notification=silent
+                    )
                     sent_ids.append(pre.message_id)
                 try:
-                    sent = await self.bot.send_sticker(owner, file)
+                    sent = await self.bot.send_sticker(
+                        owner, file, disable_notification=silent
+                    )
                 except Exception:
-                    sent = await self.bot.send_document(owner, file)
+                    sent = await self.bot.send_document(
+                        owner, file, disable_notification=silent
+                    )
             elif kind == "audio":
-                sent = await self.bot.send_audio(owner, file, caption=cap)
+                sent = await self.bot.send_audio(
+                    owner, file, caption=cap, disable_notification=silent
+                )
             else:
-                sent = await self.bot.send_document(owner, file, caption=cap)
+                sent = await self.bot.send_document(
+                    owner, file, caption=cap, disable_notification=silent
+                )
             sent_ids.append(sent.message_id)
             caption_used = True
 
         if not sent_ids:
-            sent = await self.bot.send_message(owner, body)
+            sent = await self.bot.send_message(
+                owner, body, disable_notification=silent
+            )
             sent_ids.append(sent.message_id)
 
         # Запоминаем связь: ответ реплаем на любое из этих сообщений уйдёт в
@@ -294,10 +330,26 @@ class Bridge:
                 "Мост MAX ↔ Telegram запущен.\n\n"
                 f"Твой Telegram id: `{message.from_user.id}`\n"
                 "Впиши его в TELEGRAM_OWNER_ID в .env и перезапусти мост.\n\n"
-                "Чтобы ответить в MAX — сделай *reply* на пересланное "
-                "сообщение.",
+                "*Ответить в MAX* — reply на пересланное сообщение.\n"
+                "*Заглушить чат* — reply + /mute (звук вернёт /unmute).\n"
+                "*Список заглушённых* — /muted.",
                 parse_mode="Markdown",
             )
+
+        @self.dp.message(Command("mute"))
+        async def cmd_mute(message: TgMessage) -> None:
+            if self._is_owner(message):
+                await self._toggle_mute(message, muted=True)
+
+        @self.dp.message(Command("unmute"))
+        async def cmd_unmute(message: TgMessage) -> None:
+            if self._is_owner(message):
+                await self._toggle_mute(message, muted=False)
+
+        @self.dp.message(Command("muted"))
+        async def cmd_muted(message: TgMessage) -> None:
+            if self._is_owner(message):
+                await self._list_muted(message)
 
         @self.dp.message(F.reply_to_message)
         async def on_reply(message: TgMessage) -> None:
@@ -324,6 +376,44 @@ class Bridge:
         if owner is None:
             return True  # до настройки owner_id принимаем всех (для /id)
         return message.from_user is not None and message.from_user.id == owner
+
+    async def _toggle_mute(self, message: TgMessage, *, muted: bool) -> None:
+        assert self.storage is not None
+        if message.reply_to_message is None:
+            await message.reply(
+                "Сделай эту команду *реплаем* на пересланное сообщение из "
+                "того чата, который хочешь "
+                + ("заглушить." if muted else "вернуть со звуком."),
+                parse_mode="Markdown",
+            )
+            return
+
+        resolved = await self.storage.resolve(
+            message.chat.id, message.reply_to_message.message_id
+        )
+        if resolved is None:
+            await message.reply(
+                "Не понял, какой это чат MAX — отвечай реплаем именно на "
+                "пересланное мной сообщение."
+            )
+            return
+
+        max_chat_id, _ = resolved
+        await self.storage.set_muted(max_chat_id, muted)
+        title = self._chat_title_by_id(max_chat_id)
+        if muted:
+            await message.reply(f"🔕 Чат «{title}» — теперь без звука.")
+        else:
+            await message.reply(f"🔔 Чат «{title}» — снова со звуком.")
+
+    async def _list_muted(self, message: TgMessage) -> None:
+        assert self.storage is not None
+        ids = await self.storage.list_muted()
+        if not ids:
+            await message.reply("Заглушённых чатов нет — все приходят со звуком.")
+            return
+        lines = "\n".join(f"• {self._chat_title_by_id(cid)}" for cid in ids)
+        await message.reply(f"🔕 Заглушённые чаты:\n{lines}")
 
     async def _send_to_max(self, message: TgMessage) -> None:
         assert self.storage is not None

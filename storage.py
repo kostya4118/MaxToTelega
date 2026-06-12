@@ -32,8 +32,44 @@ class Storage:
             )
             """
         )
+        await self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_prefs (
+                max_chat_id INTEGER PRIMARY KEY,
+                muted       INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
         await self._db.commit()
         return self
+
+    # ── Настройки уведомлений по чатам MAX ───────────────────────────────
+
+    async def set_muted(self, max_chat_id: int, muted: bool) -> None:
+        assert self._db is not None
+        await self._db.execute(
+            "INSERT OR REPLACE INTO chat_prefs (max_chat_id, muted) "
+            "VALUES (?, ?)",
+            (max_chat_id, 1 if muted else 0),
+        )
+        await self._db.commit()
+
+    async def is_muted(self, max_chat_id: int) -> bool:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT muted FROM chat_prefs WHERE max_chat_id = ?",
+            (max_chat_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return bool(row[0]) if row else False
+
+    async def list_muted(self) -> list[int]:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT max_chat_id FROM chat_prefs WHERE muted = 1"
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [int(r[0]) for r in rows]
 
     async def remember(
         self,
