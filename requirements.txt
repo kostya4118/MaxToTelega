@@ -1,0 +1,10 @@
+# MAX userbot (неофициальный клиент внутреннего API MAX)
+maxapi-python>=2.1.3
+# Telegram Bot API
+aiogram>=3.7,<4
+# Хранилище маршрутизации ответов
+aiosqlite>=0.20
+# HTTP-загрузка вложений из MAX
+aiohttp>=3.9
+# Конфигурация из .env
+python-dotenv>=1.0

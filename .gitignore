@@ -1,0 +1,14 @@
+# Секреты и данные сессии — НИКОГДА не коммитить
+.env
+data/
+*.db
+*.sqlite
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
