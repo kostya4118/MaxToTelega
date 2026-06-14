@@ -123,10 +123,26 @@ class Bridge:
             return label or None
         return None
 
-    async def _user_name(self, user_id: int) -> str:
-        """Имя пользователя MAX по id: из кеша, иначе тянем с сервера.
+    @classmethod
+    def _label_for(cls, user, user_id: int) -> str:
+        """Лучшее опознание: имя → @username → телефон → ID."""
+        if user is not None:
+            name = cls._name_of(user)
+            if name:
+                return name
+            link = (user.link or "").strip()
+            if link:
+                # Если это похоже на полный URL — как есть, иначе @username.
+                return link if ("/" in link or "://" in link) else f"@{link}"
+            if user.phone:
+                return f"+{user.phone}"
+        return f"ID {user_id}"
 
-        Работает даже для тех, кого нет у тебя в контактах.
+    async def _user_name(self, user_id: int) -> str:
+        """Опознание пользователя MAX по id: из кеша, иначе тянем с сервера.
+
+        Работает даже для тех, кого нет у тебя в контактах. Если имя в профиле
+        не задано — показываем @username, затем телефон, затем id.
         """
         user = self.client.get_cached_user(user_id)
         if user is None:
@@ -135,7 +151,7 @@ class Bridge:
             except Exception:
                 logger.debug("get_user(%s) не удался", user_id, exc_info=True)
                 user = None
-        return self._name_of(user) or f"ID {user_id}"
+        return self._label_for(user, user_id)
 
     async def _chat_label(self, message: Message) -> str:
         """Заголовок: для диалога — имя собеседника, для группы — её название."""
