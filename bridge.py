@@ -113,18 +113,31 @@ class Bridge:
     def _my_id(self) -> int | None:
         return self.client.me.contact.id if self.client.me else None
 
-    def _user_name(self, user_id: int) -> str:
-        for user in self.client.contacts or []:
-            if user is not None and user.id == user_id and user.names:
-                n = user.names[0]
-                label = n.name or " ".join(
-                    p for p in (n.first_name, n.last_name) if p
-                )
-                if label:
-                    return label
-        return f"ID {user_id}"
+    @staticmethod
+    def _name_of(user) -> str | None:
+        if user and user.names:
+            n = user.names[0]
+            label = n.name or " ".join(
+                p for p in (n.first_name, n.last_name) if p
+            )
+            return label or None
+        return None
 
-    def _chat_label(self, message: Message) -> str:
+    async def _user_name(self, user_id: int) -> str:
+        """Имя пользователя MAX по id: из кеша, иначе тянем с сервера.
+
+        Работает даже для тех, кого нет у тебя в контактах.
+        """
+        user = self.client.get_cached_user(user_id)
+        if user is None:
+            try:
+                user = await self.client.get_user(user_id)
+            except Exception:
+                logger.debug("get_user(%s) не удался", user_id, exc_info=True)
+                user = None
+        return self._name_of(user) or f"ID {user_id}"
+
+    async def _chat_label(self, message: Message) -> str:
         """Заголовок: для диалога — имя собеседника, для группы — её название."""
         chat = None
         for c in self.client.chats or []:
@@ -133,12 +146,14 @@ class Bridge:
                 break
         if chat is not None and chat.type != ChatType.DIALOG and chat.title:
             sender = (
-                self._user_name(message.sender) if message.sender else "?"
+                await self._user_name(message.sender)
+                if message.sender
+                else "?"
             )
             return f"{chat.title} · {sender}"
         # Диалог: показываем собеседника.
         if message.sender is not None:
-            return self._user_name(message.sender)
+            return await self._user_name(message.sender)
         return f"чат {message.chat_id}"
 
     def _is_group(self, chat_id: int | None) -> bool:
@@ -147,7 +162,7 @@ class Bridge:
                 return c.type != ChatType.DIALOG
         return False
 
-    def _chat_title_by_id(self, chat_id: int) -> str:
+    async def _chat_title_by_id(self, chat_id: int) -> str:
         """Человекочитаемое имя чата MAX по его id."""
         for c in self.client.chats or []:
             if c.id == chat_id:
@@ -156,7 +171,7 @@ class Bridge:
                 # Личный диалог: показываем собеседника.
                 for uid in c.participants or {}:
                     if uid != self._my_id():
-                        return self._user_name(uid)
+                        return await self._user_name(uid)
         return f"чат {chat_id}"
 
     # ── MAX -> Telegram ───────────────────────────────────────────────────
@@ -192,7 +207,7 @@ class Bridge:
         assert self.storage is not None
         silent = await self.storage.is_muted(message.chat_id)
 
-        header = self._chat_label(message)
+        header = await self._chat_label(message)
         body = f"💬 {header}"
         if message.text:
             body += f"\n{message.text}"
@@ -427,7 +442,7 @@ class Bridge:
 
         max_chat_id, _ = resolved
         await self.storage.set_muted(max_chat_id, muted)
-        title = self._chat_title_by_id(max_chat_id)
+        title = await self._chat_title_by_id(max_chat_id)
         if muted:
             await message.reply(f"🔕 Чат «{title}» — теперь без звука.")
         else:
@@ -439,7 +454,8 @@ class Bridge:
         if not ids:
             await message.reply("Заглушённых чатов нет — все приходят со звуком.")
             return
-        lines = "\n".join(f"• {self._chat_title_by_id(cid)}" for cid in ids)
+        titles = [await self._chat_title_by_id(cid) for cid in ids]
+        lines = "\n".join(f"• {t}" for t in titles)
         await message.reply(f"🔕 Заглушённые чаты:\n{lines}")
 
     async def _send_to_max(self, message: TgMessage) -> None:
