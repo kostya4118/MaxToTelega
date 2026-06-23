@@ -62,6 +62,38 @@ if _LOG_LEVEL != "DEBUG":
     logging.getLogger("aiogram").setLevel(logging.WARNING)
     logging.getLogger("pymax").setLevel(logging.WARNING)
 
+# Автоочистка логов: пишем в файл с ротацией по размеру и держим только
+# несколько последних частей — старые удаляются автоматически. Журнал systemd
+# (journalctl) при этом остаётся и сам ограничен своими настройками.
+# Файл по умолчанию: <WORK_DIR>/bridge.log; общий потолок = LOG_MAX_MB * (LOG_BACKUPS+1).
+_log_file_env = os.getenv("LOG_FILE", "").strip()
+if _log_file_env.lower() in ("off", "none"):
+    _LOG_FILE = ""  # файловый лог выключен
+elif _log_file_env:
+    _LOG_FILE = _log_file_env
+else:
+    _LOG_FILE = os.path.join(os.getenv("WORK_DIR", "./data"), "bridge.log")
+if _LOG_FILE:
+    from logging.handlers import RotatingFileHandler
+
+    try:
+        os.makedirs(os.path.dirname(_LOG_FILE) or ".", exist_ok=True)
+        _max_bytes = int(float(os.getenv("LOG_MAX_MB", "5")) * 1024 * 1024)
+        _file_handler = RotatingFileHandler(
+            _LOG_FILE,
+            maxBytes=_max_bytes,
+            backupCount=int(os.getenv("LOG_BACKUPS", "3")),
+            encoding="utf-8",
+        )
+        _file_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        logging.getLogger().addHandler(_file_handler)
+    except Exception:
+        logger.warning(
+            "Не удалось настроить файловый лог %s", _LOG_FILE, exc_info=True
+        )
+
 # Telegram-лимит на длину подписи к медиа.
 TG_CAPTION_LIMIT = 1024
 
