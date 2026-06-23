@@ -661,14 +661,12 @@ class Bridge:
             attachments=attachments or None,
         )
 
-        # Отмечаем исходное сообщение в MAX прочитанным.
-        if self.config.mark_read and max_message_id is not None:
-            try:
-                await self.client.read_message(
-                    message_id=max_message_id, chat_id=max_chat_id
-                )
-            except Exception:
-                logger.exception("Не удалось отметить сообщение прочитанным")
+        # ВАЖНО: отметку «прочитано» (read_message) НЕ вызываем. В текущей
+        # версии MAX этот запрос (CHAT_MARK) считается невалидным — id
+        # сообщения уходит строкой, а сервер ждёт число — и MAX в ответ
+        # РАЗРЫВАЕТ соединение. Это вызывало переподключение на каждый ответ.
+        # Пока в PyMax/MAX это не починят, фича отключена ради стабильности.
+        _ = max_message_id  # сознательно не используется
 
         # Подтверждение: в теме — реакцией (чтобы не сорить), в личке — текстом.
         if self.topic_mode:
