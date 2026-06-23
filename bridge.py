@@ -1,17 +1,16 @@
-"""Мост MAX <-> Telegram (мультиаккаунт).
+"""Мультитенантный мост MAX <-> Telegram.
 
-Левое плечо (MAX -> Telegram): на каждый MAX-аккаунт — свой userbot (PyMax),
-который пересылает входящие в Telegram. В режиме тем каждый чат MAX попадает
-в отдельную тему группы-форума этого аккаунта.
+Один общий Telegram-бот; любой пользователь может добавить свои MAX-аккаунты
+прямо через бота (вход по SMS/2FA вводится в чат). У каждого MAX-аккаунта —
+своя группа-форум: каждый чат MAX становится отдельной темой.
 
-Правое плечо (Telegram -> MAX): пишешь в теме (или реплаем в личке) — мост по
-группе определяет аккаунт, по теме — чат MAX, и отправляет туда.
-
-Один общий Telegram-бот обслуживает все аккаунты; у каждого аккаунта своя
-группа. Маршрутизация — по id группы, в которую пришло сообщение.
-
-Запуск:  python bridge.py
-Первый запуск каждого аккаунта спросит SMS-код MAX в консоли.
+Команды бота (в личке):
+  /add       — добавить MAX-аккаунт (спросит телефон, код из SMS, 2FA)
+  /accounts  — список твоих аккаунтов
+  /remove N  — удалить аккаунт N
+В группе аккаунта:
+  /bind [N]  — привязать эту группу к аккаунту
+  /mute /unmute /muted — управление уведомлениями темы
 """
 
 from __future__ import annotations
@@ -19,10 +18,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
+from dataclasses import dataclass
 
 import aiohttp
 from aiogram import Bot, Dispatcher
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     BufferedInputFile,
     InputMediaPhoto,
@@ -45,11 +46,10 @@ from pymax.types.domain import (
 )
 from pymax.types.domain.enums import ChatType
 
-from config import AccountConfig, Config
+from config import Config
+from registry import Registry
 from storage import Storage
 
-# Уровень логов берём из LOG_LEVEL (INFO по умолчанию). config импортируется
-# выше и уже подгрузил .env, поэтому переменная окружения здесь доступна.
 _LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=_LOG_LEVEL,
@@ -57,12 +57,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bridge")
 
-# Болтливые библиотеки приглушаем до предупреждений (если не включён DEBUG).
 if _LOG_LEVEL != "DEBUG":
     logging.getLogger("aiogram").setLevel(logging.WARNING)
     logging.getLogger("pymax").setLevel(logging.WARNING)
 
-# Автоочистка логов: файл с ротацией по размеру, старые части удаляются сами.
 _log_file_env = os.getenv("LOG_FILE", "").strip()
 if _log_file_env.lower() in ("off", "none"):
     _LOG_FILE = ""
@@ -76,78 +74,87 @@ if _LOG_FILE:
     try:
         os.makedirs(os.path.dirname(_LOG_FILE) or ".", exist_ok=True)
         _max_bytes = int(float(os.getenv("LOG_MAX_MB", "5")) * 1024 * 1024)
-        _file_handler = RotatingFileHandler(
-            _LOG_FILE,
-            maxBytes=_max_bytes,
-            backupCount=int(os.getenv("LOG_BACKUPS", "3")),
-            encoding="utf-8",
+        _fh = RotatingFileHandler(
+            _LOG_FILE, maxBytes=_max_bytes,
+            backupCount=int(os.getenv("LOG_BACKUPS", "3")), encoding="utf-8",
         )
-        _file_handler.setFormatter(
+        _fh.setFormatter(
             logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
         )
-        logging.getLogger().addHandler(_file_handler)
+        logging.getLogger().addHandler(_fh)
     except Exception:
-        logger.warning(
-            "Не удалось настроить файловый лог %s", _LOG_FILE, exc_info=True
+        logger.warning("Не удалось настроить файловый лог %s", _LOG_FILE)
+
+TG_CAPTION_LIMIT = 1024
+PHONE_RE = re.compile(r"^\+\d{7,15}$")
+AUTH_TIMEOUT = 300  # сек на ввод кода/пароля
+
+
+@dataclass
+class Conv:
+    """Состояние диалога с пользователем (онбординг аккаунта)."""
+
+    step: str  # 'phone' | 'login' | 'code' | 'password'
+    account_id: int | None = None
+    future: asyncio.Future | None = None
+
+
+class TelegramAuth:
+    """Провайдер кода SMS и 2FA-пароля MAX — спрашивает у пользователя в Telegram."""
+
+    def __init__(self, manager: "Manager", tg_id: int) -> None:
+        self._m = manager
+        self._tg = tg_id
+
+    async def get_code(self, phone: str) -> str:
+        return await self._m.await_input(
+            self._tg, "code",
+            f"📩 Введи код из SMS, отправленной на {phone}:",
         )
 
-# Telegram-лимит на длину подписи к медиа.
-TG_CAPTION_LIMIT = 1024
+    async def get_password(self, hint: str | None = None) -> str:
+        prompt = "🔐 Введи пароль приложения (2FA)"
+        if hint:
+            prompt += f" (подсказка: {hint})"
+        return await self._m.await_input(self._tg, "password", prompt + ":")
 
 
 class Account:
-    """Один MAX-аккаунт: свой userbot, своя сессия, своя база, своя группа.
-
-    Общий Telegram-бот и владелец инжектятся снаружи (из MultiBridge).
-    """
+    """Один MAX-аккаунт: свой userbot, своя база, своя группа-форум."""
 
     def __init__(
         self,
         bot: Bot,
-        acc: AccountConfig,
-        owner_id: int | None,
-        work_dir: str,
+        http: aiohttp.ClientSession,
+        *,
+        account_id: int,
+        owner_tg_id: int,
+        name: str,
+        group_id: int | None,
+        client: Client,
+        storage: Storage,
+        forward_groups: bool = True,
     ) -> None:
         self.bot = bot
-        self.acc = acc
-        self.name = acc.name
-        self.owner_id = owner_id
-        self.group_id = acc.telegram_group_id
-        self.topic_mode = self.group_id is not None
-        self.forward_groups = acc.forward_groups
-
-        extra = (
-            ExtraConfig(proxy=acc.max_proxy) if acc.max_proxy else None
-        )
-        if acc.max_proxy:
-            logger.info("[%s] MAX подключается через прокси", self.name)
-        self.client = Client(
-            phone=acc.max_phone,
-            work_dir=work_dir,
-            session_name=acc.max_session,
-            extra_config=extra,
-        )
-
-        self.storage: Storage | None = None
-        self.http: aiohttp.ClientSession | None = None
+        self.http = http
+        self.account_id = account_id
+        self.owner_tg_id = owner_tg_id
+        self.name = name
+        self.group_id = group_id  # привязывается через /bind, может быть None
+        self.client = client
+        self.storage = storage
+        self.forward_groups = forward_groups
         self._chat_cache: dict[int, object] = {}
         self._topic_lock = asyncio.Lock()
-
-    async def init(self, http: aiohttp.ClientSession) -> None:
-        self.http = http
-        self.storage = await Storage.create(self.acc.mapping_db)
+        self._warned_no_group = False
         self._register_max_handler()
 
-    def client_coro(self):
-        return self.client.start()
-
-    # ── Вспомогательное: имена ────────────────────────────────────────────
+    # ── имена ─────────────────────────────────────────────────────────────
 
     def _my_id(self) -> int | None:
         return self.client.me.contact.id if self.client.me else None
 
     def _max_online(self) -> bool:
-        """MAX-клиент залогинен и готов отправлять (не в процессе reconnect)."""
         app = getattr(self.client, "_app", None)
         return bool(getattr(app, "started", False))
 
@@ -163,7 +170,6 @@ class Account:
 
     @classmethod
     def _label_for(cls, user, user_id: int) -> str:
-        """Лучшее опознание: имя → @username → телефон → ID."""
         if user is not None:
             name = cls._name_of(user)
             if name:
@@ -176,7 +182,6 @@ class Account:
         return f"ID {user_id}"
 
     async def _user_name(self, user_id: int) -> str:
-        """Опознание пользователя MAX по id: из кеша, иначе тянем с сервера."""
         user = self.client.get_cached_user(user_id)
         if user is None:
             try:
@@ -187,7 +192,6 @@ class Account:
         return self._label_for(user, user_id)
 
     async def _get_chat(self, chat_id: int):
-        """Чат MAX по id: из синка/кеша, иначе дозагружаем с сервера."""
         for c in self.client.chats or []:
             if c.id == chat_id:
                 return c
@@ -201,24 +205,11 @@ class Account:
         self._chat_cache[chat_id] = chat
         return chat
 
-    async def _chat_label(self, message: Message, chat=None) -> str:
-        """Заголовок: для диалога — имя собеседника, для группы — её название."""
-        if chat is None and message.chat_id is not None:
-            chat = await self._get_chat(message.chat_id)
-        if chat is not None and chat.type != ChatType.DIALOG:
-            title = chat.title or "группа"
-            sender = (
-                await self._user_name(message.sender)
-                if message.sender
-                else "?"
-            )
-            return f"{title} · {sender}"
-        if message.sender is not None:
-            return await self._user_name(message.sender)
-        return f"чат {message.chat_id}"
+    @staticmethod
+    def _is_fallback_name(name: str) -> bool:
+        return name.startswith("ID ") or name.startswith("чат ")
 
     async def _chat_title_by_id(self, chat_id: int) -> str:
-        """Человекочитаемое имя чата MAX по его id."""
         chat = await self._get_chat(chat_id)
         if chat is None:
             return f"чат {chat_id}"
@@ -230,19 +221,13 @@ class Account:
                 if not self._is_fallback_name(name):
                     return name
                 break
-        # Часто это чат с ботом MAX — у ботов нет контактного профиля.
         if getattr(chat, "has_bots", False):
             return f"🤖 бот {chat_id}"
         return f"чат {chat_id}"
 
-    @staticmethod
-    def _is_fallback_name(name: str) -> bool:
-        return name.startswith("ID ") or name.startswith("чат ")
-
-    # ── Темы ──────────────────────────────────────────────────────────────
+    # ── темы ──────────────────────────────────────────────────────────────
 
     async def _ensure_thread(self, max_chat_id: int, chat) -> int | None:
-        """thread_id темы для чата MAX, создаётся при первом сообщении."""
         existing = await self.storage.get_topic(max_chat_id)
         if existing is not None:
             return existing
@@ -255,8 +240,8 @@ class Account:
                 topic = await self.bot.create_forum_topic(self.group_id, name)
             except Exception:
                 logger.exception(
-                    "[%s] Не удалось создать тему для чата MAX %s. Бот точно "
-                    "админ группы с правом «Управление темами», и Темы включены?",
+                    "[%s] Не удалось создать тему для чата MAX %s "
+                    "(бот админ группы с правом «Управление темами»?)",
                     self.name, max_chat_id,
                 )
                 return None
@@ -270,7 +255,6 @@ class Account:
             return topic.message_thread_id
 
     async def _maybe_rename_topic(self, max_chat_id: int, thread: int) -> None:
-        """Переименовывает тему, когда у чата появилось нормальное имя."""
         current = await self.storage.get_topic_title(max_chat_id)
         if current and not self._is_fallback_name(current):
             return
@@ -278,13 +262,10 @@ class Account:
         if desired == current or self._is_fallback_name(desired):
             return
         try:
-            await self.bot.edit_forum_topic(
-                self.group_id, thread, name=desired
-            )
+            await self.bot.edit_forum_topic(self.group_id, thread, name=desired)
             await self.storage.set_topic_title(max_chat_id, desired)
             logger.info(
-                "[%s] Тема переименована %r -> %r (чат MAX %s)",
-                self.name, current, desired, max_chat_id,
+                "[%s] Тема переименована %r -> %r", self.name, current, desired
             )
         except Exception:
             logger.debug("Не удалось переименовать тему", exc_info=True)
@@ -297,58 +278,51 @@ class Account:
             try:
                 await self._forward_to_telegram(message)
             except Exception:
-                logger.exception(
-                    "[%s] Ошибка при пересылке MAX -> Telegram", self.name
-                )
+                logger.exception("[%s] Ошибка пересылки MAX->TG", self.name)
 
     async def _forward_to_telegram(self, message: Message) -> None:
         if message.sender is not None and message.sender == self._my_id():
             return
         if message.chat_id is None:
             return
+        if self.group_id is None:
+            if not self._warned_no_group:
+                self._warned_no_group = True
+                try:
+                    await self.bot.send_message(
+                        self.owner_tg_id,
+                        f"📨 В аккаунт «{self.name}» приходят сообщения, но "
+                        "группа ещё не привязана. Создай группу-форум, добавь "
+                        "меня админом и напиши там /bind.",
+                    )
+                except Exception:
+                    pass
+            return
 
-        if self.topic_mode:
-            dest = self.group_id
-        else:
-            dest = self.owner_id
-            if dest is None:
-                logger.warning(
-                    "[%s] TELEGRAM_OWNER_ID не задан — некуда пересылать.",
-                    self.name,
-                )
-                return
-
+        dest = self.group_id
         chat = await self._get_chat(message.chat_id)
         is_group = chat is not None and chat.type != ChatType.DIALOG
         if is_group and not self.forward_groups:
             return
 
-        thread: int | None = None
-        if self.topic_mode:
-            thread = await self._ensure_thread(message.chat_id, chat)
-            if thread is None:
-                return
-            await self._maybe_rename_topic(message.chat_id, thread)
+        thread = await self._ensure_thread(message.chat_id, chat)
+        if thread is None:
+            return
+        await self._maybe_rename_topic(message.chat_id, thread)
 
-        assert self.storage is not None
         silent = await self.storage.is_muted(message.chat_id)
 
         parts: list[str] = []
-        if not self.topic_mode:
-            parts.append(f"💬 {await self._chat_label(message, chat)}")
-        elif is_group:
+        if is_group:
             sender = (
                 await self._user_name(message.sender)
-                if message.sender
-                else "?"
+                if message.sender else "?"
             )
             parts.append(f"👤 {sender}")
         if message.text:
             parts.append(message.text)
 
-        await self.bot.send_chat_action(
-            dest, "typing", message_thread_id=thread
-        )
+        await self.bot.send_chat_action(dest, "typing", message_thread_id=thread)
 
         media, notes = await self._collect_incoming_media(message)
         if not message.text and notes:
@@ -442,18 +416,11 @@ class Account:
             )
             sent_ids.append(sent.message_id)
 
-        if self.topic_mode:
-            await self.storage.set_last_message(message.chat_id, message.id)
-        else:
-            for mid in sent_ids:
-                await self.storage.remember(
-                    dest, mid, message.chat_id, message.id
-                )
+        await self.storage.set_last_message(message.chat_id, message.id)
 
     async def _collect_incoming_media(
         self, message: Message
     ) -> tuple[list[tuple[str, str, bytes]], list[str]]:
-        """Разбирает вложения MAX -> (media, notes)."""
         result: list[tuple[str, str, bytes]] = []
         notes: list[str] = []
         for attach in message.attaches:
@@ -462,7 +429,6 @@ class Account:
                     data = await self._download(attach.base_url)
                     if data:
                         result.append(("photo", "photo.jpg", data))
-
                 elif isinstance(attach, VideoAttachment):
                     info = await self.client.get_video_by_id(
                         message.chat_id, message.id, attach.video_id
@@ -473,7 +439,6 @@ class Account:
                             result.append(("video", "video.mp4", data))
                     else:
                         notes.append("🎬 видео")
-
                 elif isinstance(attach, FileAttachment):
                     info = await self.client.get_file_by_id(
                         message.chat_id, message.id, attach.file_id
@@ -481,29 +446,21 @@ class Account:
                     if info and info.url:
                         data = await self._download(info.url)
                         if data:
-                            result.append(
-                                ("document", attach.name or "file", data)
-                            )
+                            result.append(("document", attach.name or "file", data))
                     else:
                         notes.append(f"📎 файл: {attach.name or 'без имени'}")
-
                 elif isinstance(attach, StickerAttachment):
                     data = await self._download(attach.url)
                     if data:
                         result.append(("sticker", "sticker.webp", data))
                     else:
                         notes.append("🩷 стикер")
-
                 elif isinstance(attach, AudioAttachment):
-                    if attach.url:
-                        data = await self._download(attach.url)
-                        if data:
-                            result.append(("audio", "audio.mp3", data))
-                        else:
-                            notes.append("🎤 голосовое / аудио")
+                    data = await self._download(attach.url) if attach.url else None
+                    if data:
+                        result.append(("audio", "audio.mp3", data))
                     else:
                         notes.append("🎤 голосовое / аудио")
-
                 elif isinstance(attach, ContactAttachment):
                     notes.append("👤 контакт")
                 elif isinstance(attach, ShareAttachment):
@@ -523,7 +480,6 @@ class Account:
         return result, notes
 
     async def _download(self, url: str) -> bytes | None:
-        assert self.http is not None
         async with self.http.get(url) as resp:
             if resp.status != 200:
                 logger.warning("Скачивание %s -> HTTP %s", url, resp.status)
@@ -533,144 +489,97 @@ class Account:
     # ── Telegram -> MAX ───────────────────────────────────────────────────
 
     async def handle_tg(self, message: TgMessage) -> None:
-        """Обрабатывает сообщение владельца, адресованное этому аккаунту."""
-        if self.topic_mode:
-            if message.message_thread_id is None:
-                return  # General/без темы — игнорируем
-        elif message.reply_to_message is None:
-            await message.reply(
-                "Чтобы ответить в MAX, сделай *reply* на пересланное "
-                "сообщение.",
-                parse_mode="Markdown",
-            )
-            return
+        if message.message_thread_id is None:
+            return  # General/без темы
         try:
             await self._send_to_max(message)
         except Exception:
-            logger.exception(
-                "[%s] Ошибка при отправке Telegram -> MAX", self.name
-            )
+            logger.exception("[%s] Ошибка отправки TG->MAX", self.name)
             await message.reply("⚠️ Не удалось отправить в MAX (см. логи).")
 
-    async def _target_for(
-        self, message: TgMessage
-    ) -> tuple[int | None, int | None]:
-        """(max_chat_id, max_message_id) для входящего из Telegram сообщения."""
-        assert self.storage is not None
-        if self.topic_mode:
-            thread = message.message_thread_id
-            if thread is None:
-                return None, None
-            max_chat_id = await self.storage.chat_by_thread(thread)
-            if max_chat_id is None:
-                return None, None
-            last = await self.storage.get_last_message(max_chat_id)
-            return max_chat_id, last
-        if message.reply_to_message is None:
+    async def _target_for(self, message: TgMessage) -> tuple[int | None, int | None]:
+        thread = message.message_thread_id
+        if thread is None:
             return None, None
-        return await self.storage.resolve(
-            message.chat.id, message.reply_to_message.message_id
-        ) or (None, None)
+        max_chat_id = await self.storage.chat_by_thread(thread)
+        if max_chat_id is None:
+            return None, None
+        last = await self.storage.get_last_message(max_chat_id)
+        return max_chat_id, last
 
     async def toggle_mute(self, message: TgMessage, *, muted: bool) -> None:
-        assert self.storage is not None
         max_chat_id, _ = await self._target_for(message)
         if max_chat_id is None:
-            where = (
-                "внутри нужной темы."
-                if self.topic_mode
-                else "реплаем на пересланное сообщение из нужного чата."
-            )
-            await message.reply(f"Отправь эту команду {where}")
+            await message.reply("Отправь эту команду внутри нужной темы.")
             return
         await self.storage.set_muted(max_chat_id, muted)
         title = await self._chat_title_by_id(max_chat_id)
-        if muted:
-            await message.reply(f"🔕 Чат «{title}» — теперь без звука.")
-        else:
-            await message.reply(f"🔔 Чат «{title}» — снова со звуком.")
+        await message.reply(
+            f"🔕 Чат «{title}» — теперь без звука."
+            if muted else f"🔔 Чат «{title}» — снова со звуком."
+        )
 
     async def list_muted(self, message: TgMessage) -> None:
-        assert self.storage is not None
         ids = await self.storage.list_muted()
         if not ids:
-            await message.reply("Заглушённых чатов нет — все приходят со звуком.")
+            await message.reply("Заглушённых чатов нет.")
             return
         titles = [await self._chat_title_by_id(cid) for cid in ids]
-        lines = "\n".join(f"• {t}" for t in titles)
-        await message.reply(f"🔕 Заглушённые чаты:\n{lines}")
+        await message.reply(
+            "🔕 Заглушённые чаты:\n" + "\n".join(f"• {t}" for t in titles)
+        )
 
     async def _send_to_max(self, message: TgMessage) -> None:
-        max_chat_id, _max_message_id = await self._target_for(message)
+        max_chat_id, _ = await self._target_for(message)
         if max_chat_id is None:
-            if not self.topic_mode:
-                await message.reply(
-                    "Не знаю, в какой чат MAX это отправить — отвечай реплаем "
-                    "именно на пересланное мной сообщение."
-                )
             return
-
-        # Пока MAX-клиент не залогинен — не отправляем (иначе обрыв соединения).
         if not self._max_online():
             await message.reply(
-                "⏳ MAX ещё переподключается — повтори отправку через "
-                "пару секунд."
+                "⏳ MAX ещё переподключается — повтори через пару секунд."
             )
             return
-
         text = message.text or message.caption or ""
         attachments = await self._collect_outgoing_media(message)
         if not text and not attachments:
             return
-
         try:
             await self.client.send_message(
-                chat_id=max_chat_id,
-                text=text,
+                chat_id=max_chat_id, text=text,
                 attachments=attachments or None,
             )
         except ApiError as e:
             reason = (
                 getattr(e, "localized_message", None)
-                or getattr(e, "message", None)
-                or str(e)
+                or getattr(e, "message", None) or str(e)
             )
-            logger.warning(
-                "[%s] MAX отклонил отправку в чат %s: %s",
-                self.name, max_chat_id, reason,
-            )
+            logger.warning("[%s] MAX отклонил отправку: %s", self.name, reason)
             await message.reply(f"⚠️ MAX не принял сообщение: {reason}")
             return
-
-        # Отметку «прочитано» не вызываем — текущий MAX рвёт на неё соединение.
-        if self.topic_mode:
-            try:
-                await self.bot.set_message_reaction(
-                    message.chat.id,
-                    message.message_id,
-                    [ReactionTypeEmoji(emoji="👍")],
-                )
-            except Exception:
-                logger.debug("Не удалось поставить реакцию", exc_info=True)
-        else:
-            await message.reply("✅ Отправлено в MAX")
+        try:
+            await self.bot.set_message_reaction(
+                message.chat.id, message.message_id,
+                [ReactionTypeEmoji(emoji="👍")],
+            )
+        except Exception:
+            logger.debug("Не удалось поставить реакцию", exc_info=True)
 
     async def _collect_outgoing_media(
         self, message: TgMessage
     ) -> list[Photo | File | Video]:
-        """Скачивает вложения из Telegram и оборачивает в типы PyMax."""
         attachments: list[Photo | File | Video] = []
         if message.photo:
             data = await self._tg_download(message.photo[-1])
             attachments.append(Photo(raw=data, name="photo.jpg"))
         if message.document:
             data = await self._tg_download(message.document)
-            name = message.document.file_name or "file"
-            attachments.append(File(raw=data, name=name))
+            attachments.append(
+                File(raw=data, name=message.document.file_name or "file")
+            )
         if message.video:
             data = await self._tg_download(message.video)
-            name = message.video.file_name or "video.mp4"
-            attachments.append(Video(raw=data, name=name))
+            attachments.append(
+                Video(raw=data, name=message.video.file_name or "video.mp4")
+            )
         return attachments
 
     async def _tg_download(self, downloadable) -> bytes:
@@ -679,145 +588,403 @@ class Account:
         return buffer.read()
 
 
-class MultiBridge:
-    """Общий Telegram-бот, обслуживающий несколько MAX-аккаунтов."""
+class Manager:
+    """Общий бот: онбординг аккаунтов, маршрутизация, жизненный цикл."""
 
     def __init__(self, config: Config) -> None:
         self.config = config
         self.bot = Bot(config.telegram_token)
         self.dp = Dispatcher()
         self.http: aiohttp.ClientSession | None = None
-        self.accounts = [
-            Account(self.bot, acc, config.telegram_owner_id, config.work_dir)
-            for acc in config.accounts
-        ]
-        self.by_group = {
-            a.group_id: a for a in self.accounts if a.group_id is not None
-        }
-        # Аккаунт без группы (режим лички) — только в single-режиме из .env.
-        self.dm_account = next(
-            (a for a in self.accounts if a.group_id is None), None
-        )
+        self.registry: Registry | None = None
+        self.workers: dict[int, Account] = {}
+        self.tasks: dict[int, asyncio.Task] = {}
+        self.by_group: dict[int, Account] = {}
+        self.conv: dict[int, Conv] = {}
+        self.pending_announce: set[int] = set()
         self._register_handlers()
 
-    def _is_owner(self, message: TgMessage) -> bool:
-        owner = self.config.telegram_owner_id
-        if owner is None:
-            return True
-        return message.from_user is not None and message.from_user.id == owner
+    # ── ввод кода/пароля из диалога ───────────────────────────────────────
 
-    def _route(self, message: TgMessage) -> Account | None:
-        """Определяет аккаунт по группе (или личке для single-режима)."""
-        acc = self.by_group.get(message.chat.id)
-        if acc is not None:
-            return acc
-        if message.chat.type == "private" and self.dm_account is not None:
-            return self.dm_account
-        return None
-
-    def _register_handlers(self) -> None:
-        @self.dp.message(Command("start", "id"))
-        async def cmd_start(message: TgMessage) -> None:
-            ids = f"Твой Telegram id: `{message.from_user.id}`\n"
-            if message.chat.type in ("group", "supergroup"):
-                ids += f"ID этой группы: `{message.chat.id}`\n"
-                acc = self.by_group.get(message.chat.id)
-                if acc is not None:
-                    ids += f"Аккаунт этой группы: *{acc.name}*\n"
-            hint = (
-                "Каждый MAX-аккаунт — своя группа-форум, каждый чат — своя "
-                "тема. Пиши в нужной теме, чтобы ответить в тот чат MAX.\n"
-                "Заглушить тему — /mute внутри неё (вернуть — /unmute), "
-                "список — /muted."
-            )
-            await message.answer(
-                "Мост MAX ↔ Telegram запущен.\n\n" + ids + "\n" + hint,
-                parse_mode="Markdown",
-            )
-
-        @self.dp.message(Command("mute"))
-        async def cmd_mute(message: TgMessage) -> None:
-            if self._is_owner(message):
-                await self._route_command(message, "mute")
-
-        @self.dp.message(Command("unmute"))
-        async def cmd_unmute(message: TgMessage) -> None:
-            if self._is_owner(message):
-                await self._route_command(message, "unmute")
-
-        @self.dp.message(Command("muted"))
-        async def cmd_muted(message: TgMessage) -> None:
-            if self._is_owner(message):
-                await self._route_command(message, "muted")
-
-        @self.dp.message()
-        async def on_message(message: TgMessage) -> None:
-            if not self._is_owner(message):
-                return
-            acc = self._route(message)
-            if acc is None:
-                if message.chat.type == "private":
-                    await message.answer(
-                        "Пиши в нужной теме группы своего аккаунта."
-                    )
-                return
-            await acc.handle_tg(message)
-
-    async def _route_command(self, message: TgMessage, cmd: str) -> None:
-        acc = self._route(message)
-        if acc is None:
-            await message.reply(
-                "Эту команду нужно отправить внутри темы нужного аккаунта."
-            )
-            return
-        if cmd == "mute":
-            await acc.toggle_mute(message, muted=True)
-        elif cmd == "unmute":
-            await acc.toggle_mute(message, muted=False)
-        elif cmd == "muted":
-            await acc.list_muted(message)
-
-    async def run(self) -> None:
-        self.http = aiohttp.ClientSession()
-        for acc in self.accounts:
-            await acc.init(self.http)
-        client_tasks = [
-            asyncio.create_task(acc.client_coro(), name=f"max:{acc.name}")
-            for acc in self.accounts
-        ]
-        for t in client_tasks:
-            t.add_done_callback(self._on_client_done)
+    async def await_input(self, tg_id: int, step: str, prompt: str) -> str:
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        prev = self.conv.get(tg_id)
+        account_id = prev.account_id if prev else None
+        self.conv[tg_id] = Conv(step=step, account_id=account_id, future=fut)
+        await self.bot.send_message(tg_id, prompt)
         try:
-            # Поллинг держит жизненный цикл и сам ловит SIGINT/SIGTERM.
-            await self.dp.start_polling(self.bot)
-        finally:
-            for t in client_tasks:
-                t.cancel()
-            await asyncio.gather(*client_tasks, return_exceptions=True)
-            await self.http.close()
-            for acc in self.accounts:
-                if acc.storage is not None:
-                    await acc.storage.close()
-            await self.bot.session.close()
+            return await asyncio.wait_for(fut, AUTH_TIMEOUT)
+        except asyncio.TimeoutError:
+            await self.bot.send_message(
+                tg_id, "⌛ Время на ввод вышло. Начни заново: /add"
+            )
+            raise
 
-    @staticmethod
-    def _on_client_done(task: asyncio.Task) -> None:
+    # ── жизненный цикл аккаунта ───────────────────────────────────────────
+
+    def _session_name(self, acc: dict) -> str:
+        return acc["session"] or f"acc_{acc['id']}.db"
+
+    def _mapping_db(self, acc: dict) -> str:
+        return acc["mapping_db"] or os.path.join(
+            self.config.work_dir, f"acc_{acc['id']}_map.db"
+        )
+
+    def _build_client(self, acc: dict) -> Client:
+        auth = TelegramAuth(self, acc["owner_tg_id"])
+        extra = ExtraConfig(proxy=acc["proxy"]) if acc["proxy"] else None
+        client = Client(
+            phone=acc["phone"],
+            work_dir=self.config.work_dir,
+            session_name=self._session_name(acc),
+            extra_config=extra,
+            sms_code_provider=auth,
+            password_provider=auth,
+        )
+        account_id = acc["id"]
+
+        @client.on_start()
+        async def _on_start(c: Client) -> None:
+            await self._on_account_started(account_id)
+
+        return client
+
+    async def _start_account(self, account_id: int) -> Account | None:
+        acc = await self.registry.get(account_id)
+        if acc is None:
+            return None
+        client = self._build_client(acc)
+        storage = await Storage.create(self._mapping_db(acc))
+        worker = Account(
+            self.bot, self.http,
+            account_id=account_id,
+            owner_tg_id=acc["owner_tg_id"],
+            name=acc["name"] or f"MAX {account_id}",
+            group_id=acc["group_id"],
+            client=client,
+            storage=storage,
+        )
+        self.workers[account_id] = worker
+        if acc["group_id"] is not None:
+            self.by_group[acc["group_id"]] = worker
+        task = asyncio.create_task(client.start(), name=f"acc:{account_id}")
+        self.tasks[account_id] = task
+        task.add_done_callback(
+            lambda t, aid=account_id: self._on_client_done(aid, t)
+        )
+        return worker
+
+    async def _on_account_started(self, account_id: int) -> None:
+        worker = self.workers.get(account_id)
+        if worker is None:
+            return
+        await self.registry.set_status(account_id, "active")
+        if account_id in self.pending_announce:
+            self.pending_announce.discard(account_id)
+            self.conv.pop(worker.owner_tg_id, None)
+            await self.bot.send_message(
+                worker.owner_tg_id,
+                f"✅ Аккаунт «{worker.name}» вошёл в MAX!\n\n"
+                "Теперь создай группу-форум, добавь меня админом с правом "
+                "«Управление темами», и напиши в группе /bind — привяжу её к "
+                "этому аккаунту.",
+            )
+
+    def _on_client_done(self, account_id: int, task: asyncio.Task) -> None:
         if task.cancelled():
             return
         exc = task.exception()
-        if exc is not None:
-            logger.error("Аккаунт '%s' остановился: %r", task.get_name(), exc)
+        asyncio.create_task(self._account_stopped(account_id, exc))
+
+    async def _account_stopped(self, account_id: int, exc) -> None:
+        worker = self.workers.get(account_id)
+        owner = worker.owner_tg_id if worker else None
+        name = worker.name if worker else f"MAX {account_id}"
+        if account_id in self.pending_announce:
+            # упал во время онбординга — откатываем
+            self.pending_announce.discard(account_id)
+            if owner:
+                self.conv.pop(owner, None)
+                try:
+                    await self.bot.send_message(
+                        owner, f"❌ Вход не удался: {exc}. Попробуй заново: /add"
+                    )
+                except Exception:
+                    pass
+            await self._cleanup_account(account_id, delete=True)
+        else:
+            if exc is not None:
+                logger.error("Аккаунт '%s' остановился: %r", name, exc)
+                if owner:
+                    try:
+                        await self.bot.send_message(
+                            owner,
+                            f"⚠️ Аккаунт «{name}» остановился. Если MAX "
+                            "разлогинил сессию — добавь заново через /add.",
+                        )
+                    except Exception:
+                        pass
+            await self._cleanup_account(account_id, delete=False)
+
+    async def _cleanup_account(self, account_id: int, *, delete: bool) -> None:
+        task = self.tasks.pop(account_id, None)
+        if task and not task.done():
+            task.cancel()
+        worker = self.workers.pop(account_id, None)
+        if worker is not None:
+            if worker.group_id is not None:
+                self.by_group.pop(worker.group_id, None)
+            try:
+                await worker.storage.close()
+            except Exception:
+                pass
+        if delete:
+            acc = await self.registry.get(account_id)
+            if acc is not None:
+                for path in (
+                    os.path.join(self.config.work_dir, self._session_name(acc)),
+                    self._mapping_db(acc),
+                ):
+                    try:
+                        if os.path.exists(path):
+                            os.remove(path)
+                    except Exception:
+                        pass
+            await self.registry.remove(account_id)
+
+    # ── Telegram-хендлеры ─────────────────────────────────────────────────
+
+    def _register_handlers(self) -> None:
+        dp = self.dp
+
+        @dp.message(Command("start", "help"))
+        async def cmd_start(message: TgMessage) -> None:
+            await message.answer(
+                "Привет! Я зеркалю переписку MAX в Telegram.\n\n"
+                "*/add* — добавить MAX-аккаунт (спрошу телефон и код из SMS)\n"
+                "*/accounts* — твои аккаунты\n"
+                "*/remove N* — удалить аккаунт\n\n"
+                "У каждого аккаунта — своя группа-форум: после /add создаёшь "
+                "группу, добавляешь меня админом и пишешь там /bind.",
+                parse_mode="Markdown",
+            )
+
+        @dp.message(Command("add"))
+        async def cmd_add(message: TgMessage) -> None:
+            if message.chat.type != "private":
+                await message.reply("Добавляй аккаунт в личке со мной.")
+                return
+            self.conv[message.from_user.id] = Conv(step="phone")
+            await message.answer(
+                "Пришли номер телефона MAX в международном формате, например "
+                "+79991234567"
+            )
+
+        @dp.message(Command("accounts"))
+        async def cmd_accounts(message: TgMessage) -> None:
+            accs = await self.registry.list_by_owner(message.from_user.id)
+            if not accs:
+                await message.answer("У тебя пока нет аккаунтов. Добавь: /add")
+                return
+            lines = []
+            for a in accs:
+                grp = "✅ группа" if a["group_id"] else "⚠️ нет группы"
+                online = "🟢" if a["id"] in self.workers else "⚪️"
+                lines.append(
+                    f"{online} #{a['id']} «{a['name']}» {a['phone']} — {grp}"
+                )
+            await message.answer(
+                "Твои аккаунты:\n" + "\n".join(lines)
+                + "\n\nУдалить: /remove N"
+            )
+
+        @dp.message(Command("remove"))
+        async def cmd_remove(message: TgMessage, command: CommandObject) -> None:
+            if not command.args or not command.args.strip().isdigit():
+                await message.reply("Использование: /remove N (номер из /accounts)")
+                return
+            account_id = int(command.args.strip())
+            acc = await self.registry.get(account_id)
+            if acc is None or acc["owner_tg_id"] != message.from_user.id:
+                await message.reply("Нет такого аккаунта среди твоих.")
+                return
+            await self._cleanup_account(account_id, delete=True)
+            await message.reply(f"🗑 Аккаунт #{account_id} удалён.")
+
+        @dp.message(Command("bind"))
+        async def cmd_bind(message: TgMessage, command: CommandObject) -> None:
+            if message.chat.type not in ("group", "supergroup"):
+                await message.reply("Команду /bind надо отправить в группе.")
+                return
+            tg = message.from_user.id
+            group_id = message.chat.id
+            existing = await self.registry.by_group(group_id)
+            if existing is not None:
+                await message.reply(
+                    f"Эта группа уже привязана к аккаунту «{existing['name']}»."
+                )
+                return
+            free = [
+                a for a in await self.registry.list_by_owner(tg)
+                if a["group_id"] is None
+            ]
+            if command.args and command.args.strip().isdigit():
+                account_id = int(command.args.strip())
+                acc = await self.registry.get(account_id)
+                if acc is None or acc["owner_tg_id"] != tg:
+                    await message.reply("Нет такого твоего аккаунта.")
+                    return
+                if acc["group_id"] is not None:
+                    await message.reply("У этого аккаунта уже есть группа.")
+                    return
+            elif len(free) == 1:
+                account_id = free[0]["id"]
+            elif not free:
+                await message.reply(
+                    "Сначала добавь аккаунт в личке: /add (или у всех уже "
+                    "есть группы)."
+                )
+                return
+            else:
+                opts = "\n".join(
+                    f"• #{a['id']} «{a['name']}»" for a in free
+                )
+                await message.reply(
+                    "У тебя несколько аккаунтов без группы. Укажи номер: "
+                    f"/bind N\n{opts}"
+                )
+                return
+            await self.registry.set_group(account_id, group_id)
+            worker = self.workers.get(account_id)
+            if worker is not None:
+                worker.group_id = group_id
+                self.by_group[group_id] = worker
+            name = (await self.registry.get(account_id))["name"]
+            await message.reply(
+                f"✅ Группа привязана к аккаунту «{name}». Сообщения MAX будут "
+                "приходить сюда отдельными темами."
+            )
+
+        @dp.message(Command("mute"))
+        async def cmd_mute(message: TgMessage) -> None:
+            await self._route_command(message, "mute")
+
+        @dp.message(Command("unmute"))
+        async def cmd_unmute(message: TgMessage) -> None:
+            await self._route_command(message, "unmute")
+
+        @dp.message(Command("muted"))
+        async def cmd_muted(message: TgMessage) -> None:
+            await self._route_command(message, "muted")
+
+        @dp.message()
+        async def on_message(message: TgMessage) -> None:
+            tg = message.from_user.id if message.from_user else None
+            if tg is None:
+                return
+            # 1) шаги диалога онбординга
+            conv = self.conv.get(tg)
+            if conv is not None:
+                if conv.step == "phone":
+                    await self._on_phone(message)
+                    return
+                if (
+                    conv.step in ("code", "password")
+                    and conv.future is not None
+                    and not conv.future.done()
+                ):
+                    conv.future.set_result((message.text or "").strip())
+                    return
+            # 2) сообщение в привязанной группе -> в MAX
+            worker = self.by_group.get(message.chat.id)
+            if worker is not None and tg == worker.owner_tg_id:
+                await worker.handle_tg(message)
+                return
+            # 3) личка без активного диалога
+            if message.chat.type == "private":
+                await message.answer("Не понял. Команды: /add, /accounts, /help")
+
+    async def _route_command(self, message: TgMessage, cmd: str) -> None:
+        worker = self.by_group.get(message.chat.id)
+        if worker is None or message.from_user.id != worker.owner_tg_id:
+            await message.reply("Эта команда работает в группе твоего аккаунта.")
+            return
+        if cmd == "mute":
+            await worker.toggle_mute(message, muted=True)
+        elif cmd == "unmute":
+            await worker.toggle_mute(message, muted=False)
+        elif cmd == "muted":
+            await worker.list_muted(message)
+
+    async def _on_phone(self, message: TgMessage) -> None:
+        tg = message.from_user.id
+        phone = (message.text or "").strip().replace(" ", "")
+        if not PHONE_RE.match(phone):
+            await message.reply(
+                "Не похоже на номер. Формат: +79991234567. Попробуй ещё раз "
+                "или /add заново."
+            )
+            return
+        name = f"MAX …{phone[-4:]}"
+        account_id = await self.registry.add(tg, name, phone, status="login")
+        self.conv[tg] = Conv(step="login", account_id=account_id)
+        self.pending_announce.add(account_id)
+        await message.answer(
+            "📲 Запускаю вход в MAX. Сейчас придёт SMS — пришли мне код сюда."
+        )
+        await self._start_account(account_id)
+
+    # ── запуск ────────────────────────────────────────────────────────────
+
+    async def _migrate_legacy(self) -> None:
+        """Импорт старого single-аккаунта из .env, если реестр пуст."""
+        if await self.registry.list_all():
+            return
+        c = self.config
+        if not (c.legacy_phone and c.legacy_owner_id):
+            return
+        session_path = os.path.join(c.work_dir, c.legacy_session)
+        if not os.path.exists(session_path):
+            return
+        await self.registry.add(
+            c.legacy_owner_id, "default", c.legacy_phone,
+            group_id=c.legacy_group_id, session=c.legacy_session,
+            mapping_db=c.legacy_mapping_db, proxy=c.legacy_proxy,
+            status="active",
+        )
+        logger.info("Импортирован аккаунт из .env (single -> мультитенант).")
+
+    async def run(self) -> None:
+        self.http = aiohttp.ClientSession()
+        self.registry = await Registry.create(self.config.registry_db)
+        await self._migrate_legacy()
+
+        for acc in await self.registry.list_all():
+            await self._start_account(acc["id"])
+        logger.info("Поднято аккаунтов: %d", len(self.workers))
+
+        try:
+            await self.dp.start_polling(self.bot)
+        finally:
+            for task in list(self.tasks.values()):
+                task.cancel()
+            await asyncio.gather(*self.tasks.values(), return_exceptions=True)
+            await self.http.close()
+            for worker in self.workers.values():
+                try:
+                    await worker.storage.close()
+                except Exception:
+                    pass
+            await self.registry.close()
+            await self.bot.session.close()
 
 
 async def main() -> None:
     config = Config.load()
-    logger.info(
-        "Запуск моста MAX <-> Telegram. Аккаунтов: %d (%s)",
-        len(config.accounts),
-        ", ".join(a.name for a in config.accounts),
-    )
-    bridge = MultiBridge(config)
-    await bridge.run()
+    logger.info("Запуск мультитенантного моста MAX <-> Telegram…")
+    manager = Manager(config)
+    await manager.run()
 
 
 if __name__ == "__main__":
