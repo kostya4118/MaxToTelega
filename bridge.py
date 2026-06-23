@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 import aiohttp
 from aiogram import Bot, Dispatcher
@@ -45,11 +46,21 @@ from pymax.types.domain.enums import ChatType
 from config import Config
 from storage import Storage
 
+# Уровень логов берём из LOG_LEVEL (INFO по умолчанию). config импортируется
+# выше и уже подгрузил .env, поэтому переменная окружения здесь доступна.
+_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=logging.INFO,
+    level=_LOG_LEVEL,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("bridge")
+
+# Болтливые библиотеки приглушаем до предупреждений (если не включён DEBUG):
+# убирает «Update ... is handled», «session saved», «fetching users» и т.п.
+# Свои сообщения моста и ошибки остаются.
+if _LOG_LEVEL != "DEBUG":
+    logging.getLogger("aiogram").setLevel(logging.WARNING)
+    logging.getLogger("pymax").setLevel(logging.WARNING)
 
 # Telegram-лимит на длину подписи к медиа.
 TG_CAPTION_LIMIT = 1024
