@@ -30,8 +30,12 @@ from aiogram.types import Message as TgMessage
 from pymax import Client, ExtraConfig, File, Message, Photo, Video
 from pymax.types.domain import (
     AudioAttachment,
+    CallAttachment,
+    ContactAttachment,
+    ControlAttachment,
     FileAttachment,
     PhotoAttachment,
+    ShareAttachment,
     StickerAttachment,
     VideoAttachment,
 )
@@ -71,6 +75,8 @@ class Bridge:
         )
         self.storage: Storage | None = None
         self.http: aiohttp.ClientSession | None = None
+        # Кэш чатов MAX по id (дозагружаем те, которых не было при логине).
+        self._chat_cache: dict[int, object] = {}
 
         self._register_max_handlers()
         self._register_tg_handlers()
@@ -153,41 +159,52 @@ class Bridge:
                 user = None
         return self._label_for(user, user_id)
 
-    async def _chat_label(self, message: Message) -> str:
-        """Заголовок: для диалога — имя собеседника, для группы — её название."""
-        chat = None
+    async def _get_chat(self, chat_id: int):
+        """Чат MAX по id: из синка/кеша, иначе дозагружаем с сервера.
+
+        Нужно, потому что MAX на логине отдаёт не все чаты — для остальных
+        иначе не знали бы ни тип (группа/диалог), ни название.
+        """
         for c in self.client.chats or []:
-            if c.id == message.chat_id:
-                chat = c
-                break
-        if chat is not None and chat.type != ChatType.DIALOG and chat.title:
+            if c.id == chat_id:
+                return c
+        if chat_id in self._chat_cache:
+            return self._chat_cache[chat_id]
+        try:
+            chat = await self.client.get_chat(chat_id)
+        except Exception:
+            logger.debug("get_chat(%s) не удался", chat_id, exc_info=True)
+            chat = None
+        self._chat_cache[chat_id] = chat
+        return chat
+
+    async def _chat_label(self, message: Message, chat=None) -> str:
+        """Заголовок: для диалога — имя собеседника, для группы — её название."""
+        if chat is None and message.chat_id is not None:
+            chat = await self._get_chat(message.chat_id)
+        if chat is not None and chat.type != ChatType.DIALOG:
+            title = chat.title or "группа"
             sender = (
                 await self._user_name(message.sender)
                 if message.sender
                 else "?"
             )
-            return f"{chat.title} · {sender}"
+            return f"{title} · {sender}"
         # Диалог: показываем собеседника.
         if message.sender is not None:
             return await self._user_name(message.sender)
         return f"чат {message.chat_id}"
 
-    def _is_group(self, chat_id: int | None) -> bool:
-        for c in self.client.chats or []:
-            if c.id == chat_id:
-                return c.type != ChatType.DIALOG
-        return False
-
     async def _chat_title_by_id(self, chat_id: int) -> str:
         """Человекочитаемое имя чата MAX по его id."""
-        for c in self.client.chats or []:
-            if c.id == chat_id:
-                if c.type != ChatType.DIALOG and c.title:
-                    return c.title
-                # Личный диалог: показываем собеседника.
-                for uid in c.participants or {}:
-                    if uid != self._my_id():
-                        return await self._user_name(uid)
+        chat = await self._get_chat(chat_id)
+        if chat is not None:
+            if chat.type != ChatType.DIALOG and chat.title:
+                return chat.title
+            # Личный диалог: показываем собеседника.
+            for uid in chat.participants or {}:
+                if uid != self._my_id():
+                    return await self._user_name(uid)
         return f"чат {chat_id}"
 
     # ── MAX -> Telegram ───────────────────────────────────────────────────
@@ -216,14 +233,16 @@ class Bridge:
         if message.chat_id is None:
             return
 
-        if self._is_group(message.chat_id) and not self.config.forward_groups:
+        chat = await self._get_chat(message.chat_id)
+        is_group = chat is not None and chat.type != ChatType.DIALOG
+        if is_group and not self.config.forward_groups:
             return
 
         # Тихая доставка для заглушённых чатов (см. команды /mute, /unmute).
         assert self.storage is not None
         silent = await self.storage.is_muted(message.chat_id)
 
-        header = await self._chat_label(message)
+        header = await self._chat_label(message, chat)
         body = f"💬 {header}"
         if message.text:
             body += f"\n{message.text}"
@@ -231,7 +250,12 @@ class Bridge:
         # Показываем активность, пока качаем и отправляем вложения.
         await self.bot.send_chat_action(owner, "typing")
 
-        media = await self._collect_incoming_media(message)
+        media, notes = await self._collect_incoming_media(message)
+        # Если текста нет, но есть вложения, которые мы не отрисовали как медиа
+        # (голосовое, репост, системное и т.п.) — добавляем пометку, чтобы
+        # сообщение не выглядело пустым.
+        if not message.text and notes:
+            body += "\n" + "\n".join(notes)
         sent_ids: list[int] = []
 
         # Подпись вешаем на первое отправленное; если она длиннее лимита —
@@ -324,12 +348,18 @@ class Bridge:
 
     async def _collect_incoming_media(
         self, message: Message
-    ) -> list[tuple[str, str, bytes]]:
-        """Скачивает вложения MAX. Возвращает список (kind, filename, bytes).
+    ) -> tuple[list[tuple[str, str, bytes]], list[str]]:
+        """Разбирает вложения MAX.
 
-        kind ∈ {photo, video, document, sticker, audio}.
+        Возвращает ``(media, notes)``:
+        - media — список ``(kind, filename, bytes)`` для отрисовки в Telegram
+          (kind ∈ {photo, video, document, sticker, audio});
+        - notes — текстовые пометки для вложений, которые мы не отрисовываем
+          (голосовое, контакт, репост, системное и т.п.), чтобы сообщение не
+          выглядело пустым.
         """
         result: list[tuple[str, str, bytes]] = []
+        notes: list[str] = []
         for attach in message.attaches:
             try:
                 if isinstance(attach, PhotoAttachment):
@@ -345,6 +375,8 @@ class Bridge:
                         data = await self._download(info.url)
                         if data:
                             result.append(("video", "video.mp4", data))
+                    else:
+                        notes.append("🎬 видео")
 
                 elif isinstance(attach, FileAttachment):
                     info = await self.client.get_file_by_id(
@@ -356,20 +388,44 @@ class Bridge:
                             result.append(
                                 ("document", attach.name or "file", data)
                             )
+                    else:
+                        notes.append(f"📎 файл: {attach.name or 'без имени'}")
 
                 elif isinstance(attach, StickerAttachment):
                     data = await self._download(attach.url)
                     if data:
                         result.append(("sticker", "sticker.webp", data))
+                    else:
+                        notes.append("🩷 стикер")
 
                 elif isinstance(attach, AudioAttachment):
                     if attach.url:
                         data = await self._download(attach.url)
                         if data:
                             result.append(("audio", "audio.mp3", data))
+                        else:
+                            notes.append("🎤 голосовое / аудио")
+                    else:
+                        notes.append("🎤 голосовое / аудио")
+
+                elif isinstance(attach, ContactAttachment):
+                    notes.append("👤 контакт")
+                elif isinstance(attach, ShareAttachment):
+                    notes.append("🔗 ссылка / репост")
+                elif isinstance(attach, CallAttachment):
+                    notes.append("📞 звонок")
+                elif isinstance(attach, ControlAttachment):
+                    notes.append("ℹ️ системное сообщение")
+                else:
+                    # Неизвестный тип — покажем хотя бы код типа для диагностики.
+                    type_name = getattr(
+                        getattr(attach, "type", None), "value", "вложение"
+                    )
+                    notes.append(f"📎 {type_name}")
             except Exception:
-                logger.exception("Не удалось скачать вложение из MAX")
-        return result
+                logger.exception("Не удалось обработать вложение из MAX")
+                notes.append("📎 вложение (ошибка обработки)")
+        return result, notes
 
     async def _download(self, url: str) -> bytes | None:
         assert self.http is not None
