@@ -80,9 +80,6 @@ class Bridge:
         self._chat_cache: dict[int, object] = {}
         # Режим тем: каждый чат MAX — своя тема в группе-форуме.
         self.topic_mode = config.telegram_group_id is not None
-        # Чтобы один раз залогировать сырой профиль/чат, когда имя не вышло.
-        self._unnamed_logged: set[int] = set()
-        self._diag_chats: set[int] = set()
         # Сериализуем создание тем, чтобы не наплодить дублей при «залпе».
         self._topic_lock = asyncio.Lock()
 
@@ -170,21 +167,7 @@ class Bridge:
             except Exception:
                 logger.debug("get_user(%s) не удался", user_id, exc_info=True)
                 user = None
-        label = self._label_for(user, user_id)
-        # Диагностика: если имя не определилось — один раз покажем, что прислал
-        # MAX, чтобы понять, из какого поля брать имя (или что его нет совсем).
-        if label == f"ID {user_id}" and user_id not in self._unnamed_logged:
-            self._unnamed_logged.add(user_id)
-            if user is None:
-                logger.info("DIAG профиль %s: get_user вернул None", user_id)
-            else:
-                try:
-                    logger.info(
-                        "DIAG профиль %s: %r", user_id, user.model_dump()
-                    )
-                except Exception:
-                    logger.info("DIAG профиль %s: <не сериализуется>", user_id)
-        return label
+        return self._label_for(user, user_id)
 
     async def _get_chat(self, chat_id: int):
         """Чат MAX по id: из синка/кеша, иначе дозагружаем с сервера.
@@ -225,29 +208,23 @@ class Bridge:
     async def _chat_title_by_id(self, chat_id: int) -> str:
         """Человекочитаемое имя чата MAX по его id."""
         chat = await self._get_chat(chat_id)
-        name = f"чат {chat_id}"
-        if chat is not None:
-            if chat.title:
-                # Название группы — а иногда MAX так отдаёт и имя собеседника.
-                name = chat.title
-            else:
-                # Личный диалог: показываем собеседника.
-                for uid in chat.participants or {}:
-                    if uid != self._my_id():
-                        name = await self._user_name(uid)
-                        break
-        # Диагностика: имя не вышло — один раз покажем, что MAX дал про чат.
-        if (
-            self._is_fallback_name(name)
-            and chat is not None
-            and chat_id not in self._diag_chats
-        ):
-            self._diag_chats.add(chat_id)
-            try:
-                logger.info("DIAG чат %s: %r", chat_id, chat.model_dump())
-            except Exception:
-                logger.info("DIAG чат %s: <не сериализуется>", chat_id)
-        return name
+        if chat is None:
+            return f"чат {chat_id}"
+        if chat.title:
+            # Название группы — а иногда MAX так отдаёт и имя собеседника.
+            return chat.title
+        # Личный диалог: имя собеседника.
+        for uid in chat.participants or {}:
+            if uid != self._my_id():
+                name = await self._user_name(uid)
+                if not self._is_fallback_name(name):
+                    return name
+                break
+        # Имя не определилось. Часто это чат с ботом MAX — у ботов нет
+        # контактного профиля, и имя MAX нигде структурно не отдаёт.
+        if getattr(chat, "has_bots", False):
+            return f"🤖 бот {chat_id}"
+        return f"чат {chat_id}"
 
     async def _ensure_thread(self, max_chat_id: int, chat) -> int | None:
         """Возвращает thread_id темы для чата MAX, создавая её при первом разе."""
