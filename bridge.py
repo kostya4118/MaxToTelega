@@ -256,13 +256,43 @@ class Bridge:
                 )
                 return None
             await self.storage.set_topic(
-                max_chat_id, topic.message_thread_id
+                max_chat_id, topic.message_thread_id, name
             )
             logger.info(
                 "Создана тема '%s' (thread=%s) для чата MAX %s",
                 name, topic.message_thread_id, max_chat_id,
             )
             return topic.message_thread_id
+
+    @staticmethod
+    def _is_fallback_name(name: str) -> bool:
+        """Имя-заглушка (когда настоящее имя ещё не определилось)."""
+        return name.startswith("ID ") or name.startswith("чат ")
+
+    async def _maybe_rename_topic(self, max_chat_id: int, thread: int) -> None:
+        """Переименовывает тему, если у чата появилось нормальное имя.
+
+        Темы, заведённые как «ID …»/«чат …» (имя тогда не определилось),
+        получают настоящее название, когда MAX начинает его отдавать.
+        """
+        current = await self.storage.get_topic_title(max_chat_id)
+        # Уже нормальное имя — не дёргаем API на каждом сообщении.
+        if current and not self._is_fallback_name(current):
+            return
+        desired = (await self._chat_title_by_id(max_chat_id))[:128]
+        if desired == current or self._is_fallback_name(desired):
+            return
+        try:
+            await self.bot.edit_forum_topic(
+                self.config.telegram_group_id, thread, name=desired
+            )
+            await self.storage.set_topic_title(max_chat_id, desired)
+            logger.info(
+                "Тема переименована %r -> %r (чат MAX %s)",
+                current, desired, max_chat_id,
+            )
+        except Exception:
+            logger.debug("Не удалось переименовать тему", exc_info=True)
 
     # ── MAX -> Telegram ───────────────────────────────────────────────────
 
@@ -304,6 +334,7 @@ class Bridge:
             thread = await self._ensure_thread(message.chat_id, chat)
             if thread is None:
                 return  # не удалось создать/найти тему (залогировано)
+            await self._maybe_rename_topic(message.chat_id, thread)
 
         assert self.storage is not None
         silent = await self.storage.is_muted(message.chat_id)

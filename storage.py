@@ -45,10 +45,16 @@ class Storage:
             CREATE TABLE IF NOT EXISTS topics (
                 max_chat_id    INTEGER PRIMARY KEY,
                 thread_id      INTEGER NOT NULL,
-                last_max_message_id INTEGER
+                last_max_message_id INTEGER,
+                title          TEXT
             )
             """
         )
+        # Миграция для баз, созданных до появления столбца title.
+        try:
+            await self._db.execute("ALTER TABLE topics ADD COLUMN title TEXT")
+        except Exception:
+            pass  # столбец уже есть
         await self._db.commit()
         return self
 
@@ -64,14 +70,33 @@ class Storage:
             row = await cursor.fetchone()
         return int(row[0]) if row else None
 
-    async def set_topic(self, max_chat_id: int, thread_id: int) -> None:
+    async def set_topic(
+        self, max_chat_id: int, thread_id: int, title: str | None = None
+    ) -> None:
         assert self._db is not None
         await self._db.execute(
             "INSERT OR REPLACE INTO topics "
-            "(max_chat_id, thread_id, last_max_message_id) "
+            "(max_chat_id, thread_id, last_max_message_id, title) "
             "VALUES (?, ?, (SELECT last_max_message_id FROM topics "
-            "               WHERE max_chat_id = ?))",
-            (max_chat_id, thread_id, max_chat_id),
+            "               WHERE max_chat_id = ?), ?)",
+            (max_chat_id, thread_id, max_chat_id, title),
+        )
+        await self._db.commit()
+
+    async def get_topic_title(self, max_chat_id: int) -> str | None:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT title FROM topics WHERE max_chat_id = ?",
+            (max_chat_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row[0] if row and row[0] is not None else None
+
+    async def set_topic_title(self, max_chat_id: int, title: str) -> None:
+        assert self._db is not None
+        await self._db.execute(
+            "UPDATE topics SET title = ? WHERE max_chat_id = ?",
+            (title, max_chat_id),
         )
         await self._db.commit()
 
