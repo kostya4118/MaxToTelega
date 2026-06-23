@@ -28,7 +28,7 @@ from aiogram.types import (
 )
 from aiogram.types import Message as TgMessage
 
-from pymax import Client, ExtraConfig, File, Message, Photo, Video
+from pymax import ApiError, Client, ExtraConfig, File, Message, Photo, Video
 from pymax.types.domain import (
     AudioAttachment,
     CallAttachment,
@@ -125,6 +125,11 @@ class Bridge:
 
     def _my_id(self) -> int | None:
         return self.client.me.contact.id if self.client.me else None
+
+    def _max_online(self) -> bool:
+        """MAX-клиент залогинен и готов отправлять (не в процессе reconnect)."""
+        app = getattr(self.client, "_app", None)
+        return bool(getattr(app, "started", False))
 
     @staticmethod
     def _name_of(user) -> str | None:
@@ -650,16 +655,37 @@ class Bridge:
                 )
             return
 
+        # Пока MAX-клиент не залогинен (старт/переподключение), отправлять
+        # нельзя: MAX ответит «Must be ONLINE session» и разорвёт соединение.
+        if not self._max_online():
+            await message.reply(
+                "⏳ MAX ещё переподключается — повтори отправку через "
+                "пару секунд."
+            )
+            return
+
         text = message.text or message.caption or ""
         attachments = await self._collect_outgoing_media(message)
         if not text and not attachments:
             return  # нечего отправлять (например, сервисное сообщение)
 
-        await self.client.send_message(
-            chat_id=max_chat_id,
-            text=text,
-            attachments=attachments or None,
-        )
+        try:
+            await self.client.send_message(
+                chat_id=max_chat_id,
+                text=text,
+                attachments=attachments or None,
+            )
+        except ApiError as e:
+            reason = (
+                getattr(e, "localized_message", None)
+                or getattr(e, "message", None)
+                or str(e)
+            )
+            logger.warning(
+                "MAX отклонил отправку в чат %s: %s", max_chat_id, reason
+            )
+            await message.reply(f"⚠️ MAX не принял сообщение: {reason}")
+            return
 
         # ВАЖНО: отметку «прочитано» (read_message) НЕ вызываем. В текущей
         # версии MAX этот запрос (CHAT_MARK) считается невалидным — id
