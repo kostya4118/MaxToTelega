@@ -731,6 +731,10 @@ class Manager:
         task = self.tasks.pop(account_id, None)
         if task and not task.done():
             task.cancel()
+            try:
+                await task  # дождёмся закрытия сессии MAX перед удалением файлов
+            except (asyncio.CancelledError, Exception):
+                pass
         worker = self.workers.pop(account_id, None)
         if worker is not None:
             if worker.group_id is not None:
@@ -801,16 +805,31 @@ class Manager:
 
         @dp.message(Command("remove"))
         async def cmd_remove(message: TgMessage, command: CommandObject) -> None:
-            if not command.args or not command.args.strip().isdigit():
-                await message.reply("Использование: /remove N (номер из /accounts)")
+            tg = message.from_user.id
+            arg = (command.args or "").strip()
+            accs = await self.registry.list_by_owner(tg)
+            if not accs:
+                await message.reply("У тебя нет аккаунтов. Добавить: /add")
                 return
-            account_id = int(command.args.strip())
+            if not arg.isdigit():
+                lines = "\n".join(
+                    f"• #{a['id']} «{a['name']}» {a['phone']}" for a in accs
+                )
+                await message.reply(
+                    "Укажи номер аккаунта: /remove N\n\n" + lines
+                )
+                return
+            account_id = int(arg)
             acc = await self.registry.get(account_id)
-            if acc is None or acc["owner_tg_id"] != message.from_user.id:
+            if acc is None or acc["owner_tg_id"] != tg:
                 await message.reply("Нет такого аккаунта среди твоих.")
                 return
+            name = acc["name"]
             await self._cleanup_account(account_id, delete=True)
-            await message.reply(f"🗑 Аккаунт #{account_id} удалён.")
+            await message.reply(
+                f"🗑 Аккаунт #{account_id} «{name}» удалён: сессия MAX и темы "
+                "стёрты, группа отвязана (саму группу можешь удалить вручную)."
+            )
 
         @dp.message(Command("bind"))
         async def cmd_bind(message: TgMessage, command: CommandObject) -> None:
@@ -925,6 +944,22 @@ class Manager:
                 "Не похоже на номер. Формат: +79991234567. Попробуй ещё раз "
                 "или /add заново."
             )
+            return
+        # Один номер — один раз: два userbot'а на один MAX-аккаунт ведут к
+        # сбросу сессий со стороны MAX (антифрод «два устройства»).
+        existing = await self.registry.get_by_phone(phone)
+        if existing is not None:
+            self.conv.pop(tg, None)
+            if existing["owner_tg_id"] == tg:
+                await message.reply(
+                    f"У тебя уже есть аккаунт с этим номером — "
+                    f"#{existing['id']} «{existing['name']}». "
+                    f"Удалить: /remove {existing['id']}"
+                )
+            else:
+                await message.reply(
+                    "Этот номер уже подключён к боту. Один номер — один раз."
+                )
             return
         name = f"MAX …{phone[-4:]}"
         account_id = await self.registry.add(tg, name, phone, status="login")

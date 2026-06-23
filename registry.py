@@ -96,6 +96,14 @@ class Registry:
             row = await cur.fetchone()
         return dict(row) if row else None
 
+    async def get_by_phone(self, phone: str) -> dict[str, Any] | None:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT * FROM accounts WHERE phone = ? LIMIT 1", (phone,)
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
     async def by_group(self, group_id: int) -> dict[str, Any] | None:
         assert self._db is not None
         async with self._db.execute(
