@@ -1,0 +1,15 @@
+[
+  {
+    "name": "Личный",
+    "phone": "+79990000001",
+    "group_id": -1001111111111,
+    "forward_groups": true
+  },
+  {
+    "name": "Рабочий",
+    "phone": "+79990000002",
+    "group_id": -1002222222222,
+    "forward_groups": false,
+    "proxy": "http://user:pass@1.2.3.4:8080"
+  }
+]

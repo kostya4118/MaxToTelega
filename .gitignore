@@ -1,5 +1,6 @@
 # Секреты и данные сессии — НИКОГДА не коммитить
 .env
+accounts.json
 data/
 *.db
 *.sqlite
