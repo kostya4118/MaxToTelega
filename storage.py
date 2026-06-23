@@ -40,8 +40,69 @@ class Storage:
             )
             """
         )
+        await self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS topics (
+                max_chat_id    INTEGER PRIMARY KEY,
+                thread_id      INTEGER NOT NULL,
+                last_max_message_id INTEGER
+            )
+            """
+        )
         await self._db.commit()
         return self
+
+    # ── Темы (forum topics) ──────────────────────────────────────────────
+
+    async def get_topic(self, max_chat_id: int) -> int | None:
+        """thread_id темы для чата MAX или None."""
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT thread_id FROM topics WHERE max_chat_id = ?",
+            (max_chat_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row else None
+
+    async def set_topic(self, max_chat_id: int, thread_id: int) -> None:
+        assert self._db is not None
+        await self._db.execute(
+            "INSERT OR REPLACE INTO topics "
+            "(max_chat_id, thread_id, last_max_message_id) "
+            "VALUES (?, ?, (SELECT last_max_message_id FROM topics "
+            "               WHERE max_chat_id = ?))",
+            (max_chat_id, thread_id, max_chat_id),
+        )
+        await self._db.commit()
+
+    async def chat_by_thread(self, thread_id: int) -> int | None:
+        """max_chat_id по thread_id темы или None."""
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT max_chat_id FROM topics WHERE thread_id = ?",
+            (thread_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row else None
+
+    async def set_last_message(
+        self, max_chat_id: int, max_message_id: int
+    ) -> None:
+        assert self._db is not None
+        await self._db.execute(
+            "UPDATE topics SET last_max_message_id = ? WHERE max_chat_id = ?",
+            (max_message_id, max_chat_id),
+        )
+        await self._db.commit()
+
+    async def get_last_message(self, max_chat_id: int) -> int | None:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT last_max_message_id FROM topics WHERE max_chat_id = ?",
+            (max_chat_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row and row[0] is not None else None
 
     # ── Настройки уведомлений по чатам MAX ───────────────────────────────
 

@@ -21,6 +21,7 @@ def _bool(value: str | None, default: bool = False) -> bool:
 class Config:
     telegram_token: str
     telegram_owner_id: int | None
+    telegram_group_id: int | None
     max_phone: str
     work_dir: str
     max_session: str
@@ -42,6 +43,9 @@ class Config:
         owner_raw = os.getenv("TELEGRAM_OWNER_ID", "").strip()
         owner_id = int(owner_raw) if owner_raw else None
 
+        group_raw = os.getenv("TELEGRAM_GROUP_ID", "").strip()
+        group_id = int(group_raw) if group_raw else None
+
         work_dir = os.getenv("WORK_DIR", "./data").strip()
         Path(work_dir).mkdir(parents=True, exist_ok=True)
 
@@ -51,6 +55,7 @@ class Config:
         return cls(
             telegram_token=token,
             telegram_owner_id=owner_id,
+            telegram_group_id=group_id,
             max_phone=phone,
             work_dir=work_dir,
             max_session=os.getenv("MAX_SESSION", "max_session.db").strip(),

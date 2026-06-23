@@ -18,12 +18,13 @@ import asyncio
 import logging
 
 import aiohttp
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
     InputMediaPhoto,
     InputMediaVideo,
+    ReactionTypeEmoji,
 )
 from aiogram.types import Message as TgMessage
 
@@ -77,6 +78,10 @@ class Bridge:
         self.http: aiohttp.ClientSession | None = None
         # Кэш чатов MAX по id (дозагружаем те, которых не было при логине).
         self._chat_cache: dict[int, object] = {}
+        # Режим тем: каждый чат MAX — своя тема в группе-форуме.
+        self.topic_mode = config.telegram_group_id is not None
+        # Сериализуем создание тем, чтобы не наплодить дублей при «залпе».
+        self._topic_lock = asyncio.Lock()
 
         self._register_max_handlers()
         self._register_tg_handlers()
@@ -207,6 +212,38 @@ class Bridge:
                     return await self._user_name(uid)
         return f"чат {chat_id}"
 
+    async def _ensure_thread(self, max_chat_id: int, chat) -> int | None:
+        """Возвращает thread_id темы для чата MAX, создавая её при первом разе."""
+        existing = await self.storage.get_topic(max_chat_id)
+        if existing is not None:
+            return existing
+        # Блокировка: при «залпе» сообщений из нового чата не создаём дублей.
+        async with self._topic_lock:
+            existing = await self.storage.get_topic(max_chat_id)
+            if existing is not None:
+                return existing
+            name = (await self._chat_title_by_id(max_chat_id))[:128]
+            try:
+                topic = await self.bot.create_forum_topic(
+                    self.config.telegram_group_id, name
+                )
+            except Exception:
+                logger.exception(
+                    "Не удалось создать тему для чата MAX %s. Бот точно админ "
+                    "группы с правом «Управление темами», и в группе включены "
+                    "Темы?",
+                    max_chat_id,
+                )
+                return None
+            await self.storage.set_topic(
+                max_chat_id, topic.message_thread_id
+            )
+            logger.info(
+                "Создана тема '%s' (thread=%s) для чата MAX %s",
+                name, topic.message_thread_id, max_chat_id,
+            )
+            return topic.message_thread_id
+
     # ── MAX -> Telegram ───────────────────────────────────────────────────
 
     def _register_max_handlers(self) -> None:
@@ -218,53 +255,74 @@ class Bridge:
                 logger.exception("Ошибка при пересылке MAX -> Telegram")
 
     async def _forward_to_telegram(self, message: Message) -> None:
-        owner = self.config.telegram_owner_id
-        if owner is None:
-            logger.warning(
-                "TELEGRAM_OWNER_ID не задан — некуда пересылать. "
-                "Напиши боту /id, чтобы узнать свой id."
-            )
-            return
-
         # Не пересылаем собственные исходящие (иначе эхо-петля).
         if message.sender is not None and message.sender == self._my_id():
             return
-
         if message.chat_id is None:
             return
+
+        # Куда слать: в группу-форум (режим тем) или в личку владельцу.
+        if self.topic_mode:
+            dest = self.config.telegram_group_id
+        else:
+            dest = self.config.telegram_owner_id
+            if dest is None:
+                logger.warning(
+                    "TELEGRAM_OWNER_ID не задан — некуда пересылать. "
+                    "Напиши боту /id, чтобы узнать свой id."
+                )
+                return
 
         chat = await self._get_chat(message.chat_id)
         is_group = chat is not None and chat.type != ChatType.DIALOG
         if is_group and not self.config.forward_groups:
             return
 
-        # Тихая доставка для заглушённых чатов (см. команды /mute, /unmute).
+        # В режиме тем — отдельная тема под каждый чат MAX.
+        thread: int | None = None
+        if self.topic_mode:
+            thread = await self._ensure_thread(message.chat_id, chat)
+            if thread is None:
+                return  # не удалось создать/найти тему (залогировано)
+
         assert self.storage is not None
         silent = await self.storage.is_muted(message.chat_id)
 
-        header = await self._chat_label(message, chat)
-        body = f"💬 {header}"
+        # Заголовок: в личке — «💬 чат», в теме-группе — «👤 автор»,
+        # в теме-диалоге — без заголовка (тема и так названа по человеку).
+        parts: list[str] = []
+        if not self.topic_mode:
+            parts.append(f"💬 {await self._chat_label(message, chat)}")
+        elif is_group:
+            sender = (
+                await self._user_name(message.sender)
+                if message.sender
+                else "?"
+            )
+            parts.append(f"👤 {sender}")
         if message.text:
-            body += f"\n{message.text}"
+            parts.append(message.text)
 
-        # Показываем активность, пока качаем и отправляем вложения.
-        await self.bot.send_chat_action(owner, "typing")
+        await self.bot.send_chat_action(
+            dest, "typing", message_thread_id=thread
+        )
 
         media, notes = await self._collect_incoming_media(message)
-        # Если текста нет, но есть вложения, которые мы не отрисовали как медиа
-        # (голосовое, репост, системное и т.п.) — добавляем пометку, чтобы
+        # Текста нет, но есть нерисуемые вложения — добавляем пометку, чтобы
         # сообщение не выглядело пустым.
         if not message.text and notes:
-            body += "\n" + "\n".join(notes)
+            parts.extend(notes)
+        body = "\n".join(parts)
         sent_ids: list[int] = []
 
         # Подпись вешаем на первое отправленное; если она длиннее лимита —
         # отправляем её отдельным текстовым сообщением.
-        caption: str | None = body
+        caption: str | None = body or None
         caption_used = False
-        if len(body) > TG_CAPTION_LIMIT:
+        if body and len(body) > TG_CAPTION_LIMIT:
             sent = await self.bot.send_message(
-                owner, body, disable_notification=silent
+                dest, body, message_thread_id=thread,
+                disable_notification=silent,
             )
             sent_ids.append(sent.message_id)
             caption = None
@@ -281,11 +339,13 @@ class Bridge:
                 file = BufferedInputFile(data, filename=filename)
                 if kind == "photo":
                     sent = await self.bot.send_photo(
-                        owner, file, caption=cap, disable_notification=silent
+                        dest, file, caption=cap, message_thread_id=thread,
+                        disable_notification=silent,
                     )
                 else:
                     sent = await self.bot.send_video(
-                        owner, file, caption=cap, disable_notification=silent
+                        dest, file, caption=cap, message_thread_id=thread,
+                        disable_notification=silent,
                     )
                 sent_ids.append(sent.message_id)
             else:
@@ -298,7 +358,8 @@ class Bridge:
                     else:
                         group.append(InputMediaVideo(media=file, caption=item_cap))
                 msgs = await self.bot.send_media_group(
-                    owner, group, disable_notification=silent
+                    dest, group, message_thread_id=thread,
+                    disable_notification=silent,
                 )
                 sent_ids.extend(m.message_id for m in msgs)
             caption_used = True
@@ -310,41 +371,50 @@ class Bridge:
                 # У стикеров нет подписи — если она ещё не показана, шлём текст.
                 if cap:
                     pre = await self.bot.send_message(
-                        owner, cap, disable_notification=silent
+                        dest, cap, message_thread_id=thread,
+                        disable_notification=silent,
                     )
                     sent_ids.append(pre.message_id)
                 try:
                     sent = await self.bot.send_sticker(
-                        owner, file, disable_notification=silent
+                        dest, file, message_thread_id=thread,
+                        disable_notification=silent,
                     )
                 except Exception:
                     sent = await self.bot.send_document(
-                        owner, file, disable_notification=silent
+                        dest, file, message_thread_id=thread,
+                        disable_notification=silent,
                     )
             elif kind == "audio":
                 sent = await self.bot.send_audio(
-                    owner, file, caption=cap, disable_notification=silent
+                    dest, file, caption=cap, message_thread_id=thread,
+                    disable_notification=silent,
                 )
             else:
                 sent = await self.bot.send_document(
-                    owner, file, caption=cap, disable_notification=silent
+                    dest, file, caption=cap, message_thread_id=thread,
+                    disable_notification=silent,
                 )
             sent_ids.append(sent.message_id)
             caption_used = True
 
         if not sent_ids:
             sent = await self.bot.send_message(
-                owner, body, disable_notification=silent
+                dest, body or "📭 (пустое сообщение)",
+                message_thread_id=thread, disable_notification=silent,
             )
             sent_ids.append(sent.message_id)
 
-        # Запоминаем связь: ответ реплаем на любое из этих сообщений уйдёт в
-        # этот чат MAX (и отметит исходное сообщение прочитанным).
-        assert self.storage is not None
-        for mid in sent_ids:
-            await self.storage.remember(
-                owner, mid, message.chat_id, message.id
-            )
+        # Сохраняем связь для ответов.
+        if self.topic_mode:
+            # Маршрут ответа — по теме; храним id последнего сообщения MAX
+            # для отметки «прочитано».
+            await self.storage.set_last_message(message.chat_id, message.id)
+        else:
+            for mid in sent_ids:
+                await self.storage.remember(
+                    dest, mid, message.chat_id, message.id
+                )
 
     async def _collect_incoming_media(
         self, message: Message
@@ -440,13 +510,23 @@ class Bridge:
     def _register_tg_handlers(self) -> None:
         @self.dp.message(Command("start", "id"))
         async def cmd_start(message: TgMessage) -> None:
+            if self.topic_mode:
+                hint = (
+                    "Режим тем: каждый чат MAX — отдельная тема в этой "
+                    "группе. Пиши прямо в нужную тему — уйдёт в тот чат MAX.\n"
+                    "Заглушить тему — /mute внутри неё (вернуть — /unmute)."
+                )
+            else:
+                hint = (
+                    "*Ответить в MAX* — reply на пересланное сообщение.\n"
+                    "*Заглушить чат* — reply + /mute (вернуть — /unmute).\n"
+                    "*Список заглушённых* — /muted."
+                )
+            ids = f"Твой Telegram id: `{message.from_user.id}`\n"
+            if message.chat.type in ("group", "supergroup"):
+                ids += f"ID этой группы: `{message.chat.id}`\n"
             await message.answer(
-                "Мост MAX ↔ Telegram запущен.\n\n"
-                f"Твой Telegram id: `{message.from_user.id}`\n"
-                "Впиши его в TELEGRAM_OWNER_ID в .env и перезапусти мост.\n\n"
-                "*Ответить в MAX* — reply на пересланное сообщение.\n"
-                "*Заглушить чат* — reply + /mute (звук вернёт /unmute).\n"
-                "*Список заглушённых* — /muted.",
+                "Мост MAX ↔ Telegram запущен.\n\n" + ids + "\n" + hint,
                 parse_mode="Markdown",
             )
 
@@ -465,9 +545,22 @@ class Bridge:
             if self._is_owner(message):
                 await self._list_muted(message)
 
-        @self.dp.message(F.reply_to_message)
-        async def on_reply(message: TgMessage) -> None:
+        @self.dp.message()
+        async def on_message(message: TgMessage) -> None:
             if not self._is_owner(message):
+                return
+            # В режиме тем работаем только в нашей группе-форуме.
+            if self.topic_mode and message.chat.id != self.config.telegram_group_id:
+                await message.answer(
+                    "Включён режим тем — пиши в нужную тему группы."
+                )
+                return
+            if not self.topic_mode and message.reply_to_message is None:
+                await message.reply(
+                    "Чтобы ответить в MAX, сделай *reply* на пересланное "
+                    "сообщение.",
+                    parse_mode="Markdown",
+                )
                 return
             try:
                 await self._send_to_max(message)
@@ -475,44 +568,46 @@ class Bridge:
                 logger.exception("Ошибка при отправке Telegram -> MAX")
                 await message.reply("⚠️ Не удалось отправить в MAX (см. логи).")
 
-        @self.dp.message()
-        async def on_plain(message: TgMessage) -> None:
-            if not self._is_owner(message):
-                return
-            await message.reply(
-                "Чтобы ответить в MAX, сделай *reply* на пересланное "
-                "сообщение.",
-                parse_mode="Markdown",
-            )
-
     def _is_owner(self, message: TgMessage) -> bool:
         owner = self.config.telegram_owner_id
         if owner is None:
             return True  # до настройки owner_id принимаем всех (для /id)
         return message.from_user is not None and message.from_user.id == owner
 
+    async def _target_for(
+        self, message: TgMessage
+    ) -> tuple[int | None, int | None]:
+        """(max_chat_id, max_message_id) для входящего из Telegram сообщения."""
+        assert self.storage is not None
+        if self.topic_mode:
+            if message.chat.id != self.config.telegram_group_id:
+                return None, None
+            thread = message.message_thread_id
+            if thread is None:
+                return None, None
+            max_chat_id = await self.storage.chat_by_thread(thread)
+            if max_chat_id is None:
+                return None, None
+            last = await self.storage.get_last_message(max_chat_id)
+            return max_chat_id, last
+        if message.reply_to_message is None:
+            return None, None
+        return await self.storage.resolve(
+            message.chat.id, message.reply_to_message.message_id
+        ) or (None, None)
+
     async def _toggle_mute(self, message: TgMessage, *, muted: bool) -> None:
         assert self.storage is not None
-        if message.reply_to_message is None:
-            await message.reply(
-                "Сделай эту команду *реплаем* на пересланное сообщение из "
-                "того чата, который хочешь "
-                + ("заглушить." if muted else "вернуть со звуком."),
-                parse_mode="Markdown",
+        max_chat_id, _ = await self._target_for(message)
+        if max_chat_id is None:
+            where = (
+                "внутри нужной темы."
+                if self.topic_mode
+                else "реплаем на пересланное сообщение из нужного чата."
             )
+            await message.reply(f"Отправь эту команду {where}")
             return
 
-        resolved = await self.storage.resolve(
-            message.chat.id, message.reply_to_message.message_id
-        )
-        if resolved is None:
-            await message.reply(
-                "Не понял, какой это чат MAX — отвечай реплаем именно на "
-                "пересланное мной сообщение."
-            )
-            return
-
-        max_chat_id, _ = resolved
         await self.storage.set_muted(max_chat_id, muted)
         title = await self._chat_title_by_id(max_chat_id)
         if muted:
@@ -531,20 +626,19 @@ class Bridge:
         await message.reply(f"🔕 Заглушённые чаты:\n{lines}")
 
     async def _send_to_max(self, message: TgMessage) -> None:
-        assert self.storage is not None
-        resolved = await self.storage.resolve(
-            message.chat.id, message.reply_to_message.message_id
-        )
-        if resolved is None:
-            await message.reply(
-                "Не знаю, в какой чат MAX это отправить — отвечай реплаем "
-                "именно на пересланное мной сообщение."
-            )
+        max_chat_id, max_message_id = await self._target_for(message)
+        if max_chat_id is None:
+            if not self.topic_mode:
+                await message.reply(
+                    "Не знаю, в какой чат MAX это отправить — отвечай реплаем "
+                    "именно на пересланное мной сообщение."
+                )
             return
 
-        max_chat_id, max_message_id = resolved
         text = message.text or message.caption or ""
         attachments = await self._collect_outgoing_media(message)
+        if not text and not attachments:
+            return  # нечего отправлять (например, сервисное сообщение)
 
         await self.client.send_message(
             chat_id=max_chat_id,
@@ -561,7 +655,18 @@ class Bridge:
             except Exception:
                 logger.exception("Не удалось отметить сообщение прочитанным")
 
-        await message.reply("✅ Отправлено в MAX")
+        # Подтверждение: в теме — реакцией (чтобы не сорить), в личке — текстом.
+        if self.topic_mode:
+            try:
+                await self.bot.set_message_reaction(
+                    message.chat.id,
+                    message.message_id,
+                    [ReactionTypeEmoji(emoji="👍")],
+                )
+            except Exception:
+                logger.debug("Не удалось поставить реакцию", exc_info=True)
+        else:
+            await message.reply("✅ Отправлено в MAX")
 
     async def _collect_outgoing_media(
         self, message: TgMessage
