@@ -80,6 +80,8 @@ class Bridge:
         self._chat_cache: dict[int, object] = {}
         # Режим тем: каждый чат MAX — своя тема в группе-форуме.
         self.topic_mode = config.telegram_group_id is not None
+        # Чтобы один раз залогировать сырой профиль, когда имя не определилось.
+        self._unnamed_logged: set[int] = set()
         # Сериализуем создание тем, чтобы не наплодить дублей при «залпе».
         self._topic_lock = asyncio.Lock()
 
@@ -162,7 +164,20 @@ class Bridge:
             except Exception:
                 logger.debug("get_user(%s) не удался", user_id, exc_info=True)
                 user = None
-        return self._label_for(user, user_id)
+        label = self._label_for(user, user_id)
+        # Диагностика: если имя не определилось — один раз покажем, что прислал
+        # MAX, чтобы понять, из какого поля брать имя.
+        if (
+            user is not None
+            and label == f"ID {user_id}"
+            and user_id not in self._unnamed_logged
+        ):
+            self._unnamed_logged.add(user_id)
+            try:
+                logger.info("DIAG профиль %s: %r", user_id, user.model_dump())
+            except Exception:
+                logger.info("DIAG профиль %s: <не удалось сериализовать>", user_id)
+        return label
 
     async def _get_chat(self, chat_id: int):
         """Чат MAX по id: из синка/кеша, иначе дозагружаем с сервера.
