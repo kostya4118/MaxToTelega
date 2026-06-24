@@ -23,6 +23,9 @@ class Config:
     work_dir: str
     registry_db: str
     admin_ids: list[int]
+    add_cooldown: int          # сек между попытками /add
+    add_per_hour: int          # макс. регистраций в час на пользователя
+    max_accounts: int          # макс. аккаунтов на пользователя
 
     # Для одноразовой миграции старого single-аккаунта (если реестр пуст).
     legacy_owner_id: int | None
@@ -62,11 +65,18 @@ class Config:
         else:
             admin_ids = []
 
+        def _int(name: str, default: int) -> int:
+            raw = os.getenv(name, "").strip()
+            return int(raw) if raw.lstrip("-").isdigit() else default
+
         return cls(
             telegram_token=token,
             work_dir=work_dir,
             registry_db=registry_db,
             admin_ids=admin_ids,
+            add_cooldown=_int("ADD_COOLDOWN_SEC", 30),
+            add_per_hour=_int("ADD_MAX_PER_HOUR", 5),
+            max_accounts=_int("MAX_ACCOUNTS_PER_USER", 5),
             legacy_owner_id=int(owner_raw) if owner_raw else None,
             legacy_phone=(os.getenv("MAX_PHONE", "").strip() or None),
             legacy_group_id=int(group_raw) if group_raw else None,

@@ -19,6 +19,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 
 import aiohttp
@@ -753,7 +754,45 @@ class Manager:
         self.admin_ids: set[int] = set(config.admin_ids)
         self.pending_reqs: dict[int, dict] = {}  # req_id -> {requester, phone}
         self._req_counter = 0
+        # Антифлуд: попытки /add и кулдауны «тяжёлых» команд (по монотонным сек).
+        self._add_times: dict[int, list[float]] = {}
+        self._cmd_times: dict[tuple[int, str], float] = {}
         self._register_handlers()
+
+    # ── антифлуд ──────────────────────────────────────────────────────────
+
+    def _cmd_cooldown(self, tg: int, key: str, seconds: int) -> int:
+        """0 если можно, иначе сколько секунд ещё ждать. Запоминает срабатывание."""
+        if tg in self.admin_ids:
+            return 0
+        now = time.monotonic()
+        last = self._cmd_times.get((tg, key), 0.0)
+        if now - last < seconds:
+            return int(seconds - (now - last)) + 1
+        self._cmd_times[(tg, key)] = now
+        return 0
+
+    async def _check_add_quota(self, tg: int) -> str | None:
+        """None если /add разрешён, иначе текст отказа. Учитывает попытку."""
+        if tg in self.admin_ids:
+            return None
+        accs = await self.registry.list_by_owner(tg)
+        if len(accs) >= self.config.max_accounts:
+            return (
+                f"У тебя уже {len(accs)} аккаунт(ов) — это максимум "
+                f"({self.config.max_accounts}). Удали лишний: /remove N"
+            )
+        now = time.monotonic()
+        hist = [t for t in self._add_times.get(tg, []) if now - t < 3600]
+        if hist and now - hist[-1] < self.config.add_cooldown:
+            wait = int(self.config.add_cooldown - (now - hist[-1])) + 1
+            return f"⏳ Слишком часто. Подожди {wait} сек и повтори /add."
+        if len(hist) >= self.config.add_per_hour:
+            return (
+                "🚧 Лимит регистраций на час исчерпан. Попробуй позже."
+            )
+        self._add_times[tg] = hist + [now]
+        return None
 
     # ── ввод кода/пароля из диалога ───────────────────────────────────────
 
@@ -980,6 +1019,10 @@ class Manager:
                     "Прокси должен начинаться с http://, https:// или socks5://"
                 )
                 return
+            wait = self._cmd_cooldown(tg, "restart", 15)
+            if wait:
+                await message.reply(f"⏳ Слишком часто. Подожди {wait} сек.")
+                return
             await self.registry.set_proxy(account_id, proxy)
             await message.reply(
                 f"🌐 Прокси для #{account_id} "
@@ -1005,6 +1048,10 @@ class Manager:
             if acc is None or acc["owner_tg_id"] != tg:
                 await message.reply("Нет такого аккаунта среди твоих.")
                 return
+            wait = self._cmd_cooldown(tg, "restart", 15)
+            if wait:
+                await message.reply(f"⏳ Слишком часто. Подожди {wait} сек.")
+                return
             await message.reply("🔄 Перезапускаю вход в MAX…")
             await self._restart_account(account_id, announce=True)
 
@@ -1013,7 +1060,12 @@ class Manager:
             if message.chat.type != "private":
                 await message.reply("Добавляй аккаунт в личке со мной.")
                 return
-            self.conv[message.from_user.id] = Conv(step="phone")
+            tg = message.from_user.id
+            reason = await self._check_add_quota(tg)
+            if reason:
+                await message.answer(reason)
+                return
+            self.conv[tg] = Conv(step="phone")
             await message.answer(
                 "Пришли номер телефона MAX в международном формате, например "
                 "+79991234567"
