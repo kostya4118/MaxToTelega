@@ -71,15 +71,32 @@ from registry import Registry
 from storage import Storage
 
 _LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+_LOG_FMT = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
 logging.basicConfig(
     level=_LOG_LEVEL,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-logger = logging.getLogger("bridge")
 
-if _LOG_LEVEL != "DEBUG":
-    logging.getLogger("aiogram").setLevel(logging.WARNING)
-    logging.getLogger("pymax").setLevel(logging.WARNING)
+# Логгер моста делаем НЕЗАВИСИМЫМ от root: PyMax при создании каждого Client
+# вызывает свой configure_logging и переопределяет root-настройки, заглушая
+# наши логи. Свой хендлер + propagate=False это исключает.
+logger = logging.getLogger("bridge")
+logger.setLevel(getattr(logging, _LOG_LEVEL, logging.INFO))
+logger.propagate = False
+_bridge_stream = logging.StreamHandler()
+_bridge_stream.setFormatter(_LOG_FMT)
+logger.addHandler(_bridge_stream)
+
+
+def _quiet_libs() -> None:
+    """Приглушает болтливые библиотеки. PyMax сбрасывает уровни при создании
+    Client, поэтому вызывается повторно после старта каждого аккаунта."""
+    if _LOG_LEVEL != "DEBUG":
+        logging.getLogger("aiogram").setLevel(logging.WARNING)
+        logging.getLogger("pymax").setLevel(logging.WARNING)
+
+
+_quiet_libs()
 
 
 class _BenignPymaxNoise(logging.Filter):
@@ -119,10 +136,9 @@ if _LOG_FILE:
             _LOG_FILE, maxBytes=_max_bytes,
             backupCount=int(os.getenv("LOG_BACKUPS", "3")), encoding="utf-8",
         )
-        _fh.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-        )
-        logging.getLogger().addHandler(_fh)
+        _fh.setFormatter(_LOG_FMT)
+        logging.getLogger().addHandler(_fh)   # root: aiogram/pymax
+        logger.addHandler(_fh)                # bridge (т.к. propagate=False)
     except Exception:
         logger.warning("Не удалось настроить файловый лог %s", _LOG_FILE)
 
@@ -1157,6 +1173,7 @@ class Manager:
         task.add_done_callback(
             lambda t, aid=account_id: self._on_client_done(aid, t)
         )
+        _quiet_libs()  # PyMax сбрасывает уровни логов при создании Client
         return worker
 
     async def _on_account_started(self, account_id: int) -> None:
