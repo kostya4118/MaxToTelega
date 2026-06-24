@@ -1024,14 +1024,13 @@ class Manager:
         async def cmd_start(message: TgMessage) -> None:
             await message.answer(
                 "Привет! Я зеркалю переписку MAX в Telegram.\n\n"
-                "*/add* — добавить MAX-аккаунт (спрошу телефон и код из SMS)\n"
-                "*/accounts* — твои аккаунты\n"
-                "*/remove N* — удалить аккаунт\n"
-                "*/setproxy N <url>* — задать прокси (или off — убрать)\n"
-                "*/relogin N* — повторить вход (после прокси / сброса сессии)\n\n"
+                "/add — добавить MAX-аккаунт (спрошу телефон и код из SMS)\n"
+                "/accounts — твои аккаунты\n"
+                "/remove N — удалить аккаунт\n"
+                "/setproxy N <url> — задать прокси (или off — убрать)\n"
+                "/relogin N — повторить вход (после прокси / сброса сессии)\n\n"
                 "У каждого аккаунта — своя группа-форум: после /add создаёшь "
-                "группу, добавляешь меня админом и пишешь там /bind.",
-                parse_mode="Markdown",
+                "группу, добавляешь меня админом и пишешь там /bind."
             )
 
         @dp.message(Command("setproxy"))
@@ -1398,15 +1397,14 @@ class Manager:
             status[a["status"]] = status.get(a["status"], 0) + 1
         st = ", ".join(f"{k}: {v}" for k, v in sorted(status.items())) or "—"
         await message.answer(
-            "👑 *Админ-панель*\n"
+            "👑 Админ-панель\n"
             f"Пользователей: {users}\n"
             f"Аккаунтов: {len(accs)} (🟢 онлайн {online})\n"
             f"Статусы: {st}\n"
             f"Забанено: {len(bans)}\n\n"
             "Подробно: /admin list | /admin user <tg_id>\n"
             "Управление: /admin stop N | start N | remove N\n"
-            "Доступ: /ban <tg_id> | /unban <tg_id> | /banned",
-            parse_mode="Markdown",
+            "Доступ: /ban <tg_id> | /unban <tg_id> | /banned"
         )
 
     async def _admin_list(self, message: TgMessage, owner: int | None = None) -> None:
