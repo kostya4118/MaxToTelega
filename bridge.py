@@ -738,7 +738,7 @@ class Account:
 
         await self.bot.send_chat_action(dest, "typing", message_thread_id=thread)
 
-        media, notes = await self._collect_incoming_media(message)
+        media, notes, specials = await self._collect_incoming_media(message)
         if not message.text and notes:
             parts.extend(notes)
 
@@ -837,6 +837,34 @@ class Account:
                 records.append((sent.message_id, "caption" if cap else "media"))
             caption_used = True
 
+        # Спец-вложения (контакт/гео/опрос) — отдельными методами Telegram.
+        for kind, data in specials:
+            try:
+                if kind == "contact":
+                    sent = await self.bot.send_contact(
+                        dest, phone_number=data["phone"],
+                        first_name=data["first"],
+                        last_name=data.get("last") or None,
+                        message_thread_id=thread, disable_notification=silent,
+                    )
+                elif kind == "location":
+                    sent = await self.bot.send_location(
+                        dest, latitude=data["lat"], longitude=data["lon"],
+                        message_thread_id=thread, disable_notification=silent,
+                    )
+                elif kind == "poll":
+                    sent = await self.bot.send_poll(
+                        dest, question=data["question"],
+                        options=data["options"], is_anonymous=True,
+                        message_thread_id=thread, disable_notification=silent,
+                    )
+                else:
+                    continue
+                records.append((sent.message_id, "media"))
+            except Exception:
+                logger.info("[%s] спец-вложение %s не отправить",
+                            self.name, kind, exc_info=True)
+
         if not records:
             if message.chat_id not in self._diag_empty:
                 self._diag_empty.add(message.chat_id)
@@ -872,9 +900,10 @@ class Account:
 
     async def _collect_incoming_media(
         self, message: Message
-    ) -> tuple[list[tuple[str, str, bytes]], list[str]]:
+    ) -> tuple[list[tuple[str, str, bytes]], list[str], list[tuple[str, dict]]]:
         result: list[tuple[str, str, bytes]] = []
         notes: list[str] = []
+        specials: list[tuple[str, dict]] = []  # ('contact'|'location'|'poll', data)
         for attach in message.attaches:
             try:
                 if isinstance(attach, PhotoAttachment):
@@ -917,8 +946,23 @@ class Account:
                     nm = attach.name or " ".join(
                         p for p in (attach.first_name, attach.last_name) if p
                     )
-                    notes.append(f"👤 Контакт: {nm}" if nm else "👤 контакт")
-                    self._diag_attach(attach)
+                    phone = None
+                    try:
+                        u = await self.client.get_user(attach.contact_id)
+                        if u and u.phone:
+                            phone = u.phone
+                    except Exception:
+                        pass
+                    if phone:
+                        specials.append(("contact", {
+                            "phone": f"+{phone}",
+                            "first": attach.first_name or nm or "Контакт",
+                            "last": attach.last_name or "",
+                        }))
+                    else:
+                        notes.append(
+                            f"👤 Контакт: {nm}" if nm else "👤 контакт"
+                        )
                 elif isinstance(attach, ShareAttachment):
                     notes.append("🔗 ссылка / репост")
                 elif isinstance(attach, CallAttachment):
@@ -935,7 +979,7 @@ class Account:
             except Exception:
                 logger.exception("Не удалось обработать вложение из MAX")
                 notes.append("📎 вложение (ошибка обработки)")
-        return result, notes
+        return result, notes, specials
 
     def _diag_attach(self, attach) -> None:
         """Один раз на тип логирует сырое вложение — чтобы отрисовать его потом."""
