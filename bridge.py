@@ -245,6 +245,7 @@ class Account:
         self._warned_no_group = False
         self._diag_empty: set[int] = set()
         self._sent_since_trim = 0
+        self._reaction_diag_done = False
         self._register_max_handler()
 
     # ── имена ─────────────────────────────────────────────────────────────
@@ -396,14 +397,34 @@ class Account:
 
         async def on_max_reaction(event, client: Client) -> None:
             try:
-                await self._mirror_reaction(event)
+                await self._apply_reaction(
+                    getattr(event, "message_id", None),
+                    getattr(event, "counters", None),
+                    getattr(event, "total_count", 0),
+                )
             except Exception:
                 logger.debug("[%s] Ошибка зеркалирования реакции",
                              self.name, exc_info=True)
 
+        async def on_max_raw(frame, client: Client) -> None:
+            # Реакции на версиях PyMax без on_reaction_update: ловим сырой
+            # фрейм опкода 155 (NOTIF_MSG_REACTIONS_CHANGED).
+            try:
+                if getattr(frame, "opcode", None) != 155:
+                    return
+                await self._handle_raw_reaction(
+                    getattr(frame, "payload", None) or {}
+                )
+            except Exception:
+                logger.debug("[%s] raw-реакция не разобрана",
+                             self.name, exc_info=True)
+
         self._register_optional("on_message_edit", on_max_edit)
         self._register_optional("on_message_delete", on_max_delete)
-        self._register_optional("on_reaction_update", on_max_reaction)
+        if callable(getattr(self.client, "on_reaction_update", None)):
+            self._register_optional("on_reaction_update", on_max_reaction)
+        else:
+            self._register_optional("on_raw", on_max_raw)
 
     def _register_optional(self, hook: str, handler) -> None:
         """Регистрирует обработчик, если такой хук есть в этой версии PyMax."""
@@ -475,12 +496,16 @@ class Account:
                     logger.debug("delete_message не удался", exc_info=True)
             await self.storage.forget_msg(max_msg_id)
 
-    async def _mirror_reaction(self, event) -> None:
+    @staticmethod
+    def _counter_field(c, key):
+        return c.get(key) if isinstance(c, dict) else getattr(c, key, None)
+
+    async def _apply_reaction(self, message_id, counters, total_count) -> None:
         """Ставит доминирующую реакцию MAX на копию сообщения в Telegram."""
-        if self.group_id is None:
+        if self.group_id is None or message_id is None:
             return
         try:
-            max_msg_id = int(event.message_id)
+            max_msg_id = int(message_id)
         except (TypeError, ValueError):
             return
         rows = await self.storage.get_msg_map(max_msg_id)
@@ -492,10 +517,10 @@ class Account:
             (rows[0][0], rows[0][1]),
         )
         reactions: list[ReactionTypeEmoji] = []
-        counters = getattr(event, "counters", None) or []
-        if counters and getattr(event, "total_count", 0):
-            top = max(counters, key=lambda c: getattr(c, "count", 0))
-            emoji = (getattr(top, "reaction", "") or "").strip()
+        counters = counters or []
+        if counters and total_count:
+            top = max(counters, key=lambda c: self._counter_field(c, "count") or 0)
+            emoji = (self._counter_field(top, "reaction") or "").strip()
             if emoji:
                 reactions = [ReactionTypeEmoji(emoji=emoji)]
         try:
@@ -503,6 +528,35 @@ class Account:
             await self.bot.set_message_reaction(target[0], target[1], reactions)
         except Exception:
             logger.debug("Реакцию не отзеркалить", exc_info=True)
+
+    async def _handle_raw_reaction(self, payload: dict) -> None:
+        """Разбирает сырой payload опкода 155 и зеркалит реакцию."""
+        if not self._reaction_diag_done:
+            self._reaction_diag_done = True
+            logger.info(
+                "[%s] DIAG reaction payload: %r", self.name, str(payload)[:800]
+            )
+        info = payload
+        if not (isinstance(info, dict) and ("messageId" in info or "chatId" in info)):
+            for key in ("reactionInfo", "message", "reactions"):
+                v = payload.get(key) if isinstance(payload, dict) else None
+                if isinstance(v, dict):
+                    info = v
+                    break
+        if not isinstance(info, dict):
+            return
+        message_id = info.get("messageId") or payload.get("messageId")
+        counters = (
+            info.get("counters")
+            or (info.get("reactionInfo") or {}).get("counters")
+            or payload.get("counters")
+        )
+        total = (
+            info.get("totalCount")
+            or payload.get("totalCount")
+            or (len(counters) if counters else 0)
+        )
+        await self._apply_reaction(message_id, counters, total)
 
     async def _forward_to_telegram(self, message: Message) -> None:
         if message.sender is not None and message.sender == self._my_id():
