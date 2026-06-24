@@ -960,7 +960,7 @@ class Account:
                     except Exception:
                         logger.debug("get_user для контакта не удался",
                                      exc_info=True)
-                    logger.info(
+                    logger.debug(
                         "[%s] контакт %s phone_found=%s",
                         self.name, attach.contact_id, bool(phone),
                     )
