@@ -431,9 +431,9 @@ class Account:
                 # увидеть, каким фреймом приходит реакция.
                 if op not in self._seen_opcodes:
                     self._seen_opcodes.add(op)
-                    keys = list(payload.keys()) if isinstance(payload, dict) else "?"
                     logger.info(
-                        "[%s] raw opcode=%s keys=%s", self.name, op, keys
+                        "[%s] raw opcode=%s payload=%r",
+                        self.name, op, str(payload)[:600],
                     )
                 if op == 155:
                     await self._handle_raw_reaction(payload)
@@ -443,10 +443,9 @@ class Account:
 
         self._register_optional("on_message_edit", on_max_edit)
         self._register_optional("on_message_delete", on_max_delete)
-        if callable(getattr(self.client, "on_reaction_update", None)):
-            self._register_optional("on_reaction_update", on_max_reaction)
-        else:
-            self._register_optional("on_raw", on_max_raw)
+        self._register_optional("on_reaction_update", on_max_reaction)
+        # on_raw — диагностика опкодов и фолбэк-обработка реакций (опкод 155).
+        self._register_optional("on_raw", on_max_raw)
 
     def _register_optional(self, hook: str, handler) -> None:
         """Регистрирует обработчик, если такой хук есть в этой версии PyMax."""
