@@ -244,7 +244,7 @@ class Storage:
         assert self._db is not None
         async with self._db.execute(
             "SELECT tg_chat_id, tg_message_id, role, body FROM msg_map "
-            "WHERE max_message_id = ? AND role IN ('text','caption') "
+            "WHERE max_message_id = ? AND role IN ('text','caption','user') "
             "ORDER BY rowid_alias LIMIT 1",
             (max_message_id,),
         ) as cur:

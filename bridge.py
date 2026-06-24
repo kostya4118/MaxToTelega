@@ -39,6 +39,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InputMediaPhoto,
     InputMediaVideo,
+    ReactionTypeEmoji,
 )
 from aiogram.types import Message as TgMessage
 
@@ -523,10 +524,12 @@ class Account:
         return c.get(key) if isinstance(c, dict) else getattr(c, key, None)
 
     async def _apply_reaction(self, message_id, counters, total_count) -> None:
-        """Показывает реакции MAX, дописывая их подписью к копии сообщения.
+        """Отражает реакции MAX на копии сообщения в Telegram.
 
-        Бот не может видимо «отреагировать» на собственное сообщение, поэтому
-        реакции добавляются строкой в конец текста/подписи (с количеством).
+        - Входящее (сообщение бота): реакции нельзя поставить видимо, поэтому
+          дописываем их строкой к тексту/подписи.
+        - Своё (сообщение пользователя, роль 'user'): бот ставит видимую
+          реакцию через set_message_reaction.
         """
         if self.group_id is None or message_id is None:
             return
@@ -543,19 +546,37 @@ class Account:
             return
         tg_chat, tg_msg, role, body = target
 
-        # Собираем строку реакций: «❤️2 🤣1».
+        # Разбираем реакции: чипсы для подписи и доминирующая для нативной.
         chips = []
+        dominant = ""
+        best = -1
         for c in counters or []:
             emoji = (self._counter_field(c, "reaction") or "").strip()
             cnt = self._counter_field(c, "count") or 0
-            if emoji:
-                chips.append(f"{emoji}{cnt}" if cnt > 1 else emoji)
+            if not emoji:
+                continue
+            chips.append(f"{emoji}{cnt}" if cnt > 1 else emoji)
+            if cnt > best:
+                best, dominant = cnt, emoji
         footer = " ".join(chips)
-        base = body or ""
-        new_text = base + (f"\n{footer}" if footer else "")
         logger.info(
-            "[%s] реакции msg=%s -> %r", self.name, max_msg_id, footer
+            "[%s] реакции msg=%s role=%s -> %r", self.name, max_msg_id, role, footer
         )
+
+        if role == "user":
+            # Сообщение пользователя — ставим видимую реакцию (или снимаем).
+            reactions = [ReactionTypeEmoji(emoji=dominant)] if dominant else []
+            try:
+                await self.bot.set_message_reaction(tg_chat, tg_msg, reactions)
+            except Exception as e:
+                if not reactions and "EMPTY" in str(e).upper():
+                    logger.debug("нечего снимать")
+                else:
+                    logger.info("[%s] реакцию не поставить: %s", self.name, e)
+            return
+
+        # Входящее (сообщение бота) — дописываем реакции подписью.
+        new_text = (body or "") + (f"\n{footer}" if footer else "")
         try:
             if role == "caption":
                 await self.bot.edit_message_caption(
@@ -1024,7 +1045,7 @@ class Account:
         if not text and not attachments:
             return
         try:
-            await self.client.send_message(
+            sent = await self.client.send_message(
                 chat_id=max_chat_id, text=text,
                 attachments=attachments or None,
             )
@@ -1036,6 +1057,14 @@ class Account:
             logger.warning("[%s] MAX отклонил отправку: %s", self.name, reason)
             await message.reply(f"⚠️ MAX не принял сообщение: {reason}")
             return
+        # Запоминаем связь со своим (исходящим) сообщением — чтобы показать
+        # реакции собеседника на него. Это сообщение ПОЛЬЗОВАТЕЛЯ, поэтому на
+        # него бот может поставить видимую реакцию (роль 'user').
+        if sent is not None and getattr(sent, "id", None) is not None:
+            await self.storage.remember_msg(
+                max_chat_id, sent.id, message.chat.id, message.message_id,
+                "user",
+            )
         # Успешная отправка — без подтверждения (👍 убрали). Об ошибке выше
         # пользователь узнаёт отдельным ответом.
 
