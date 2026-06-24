@@ -64,6 +64,27 @@ if _LOG_LEVEL != "DEBUG":
     logging.getLogger("aiogram").setLevel(logging.WARNING)
     logging.getLogger("pymax").setLevel(logging.WARNING)
 
+
+class _BenignPymaxNoise(logging.Filter):
+    """Глушит ожидаемые ошибки MAX (нет доступа к пересланным файлам/видео).
+
+    Мост их уже обрабатывает (показывает пометку), а в логах они только шумят.
+    На уровне DEBUG ничего не фильтруем.
+    """
+
+    MARKERS = ("error.user.file.access", "video.not.found")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        return not any(m in msg for m in self.MARKERS)
+
+
+if _LOG_LEVEL != "DEBUG":
+    logging.getLogger("pymax.app").addFilter(_BenignPymaxNoise())
+
 _log_file_env = os.getenv("LOG_FILE", "").strip()
 if _log_file_env.lower() in ("off", "none"):
     _LOG_FILE = ""
