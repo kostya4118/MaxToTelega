@@ -42,7 +42,16 @@ from aiogram.types import (
 )
 from aiogram.types import Message as TgMessage
 
-from pymax import ApiError, Client, ExtraConfig, File, Message, Photo, Video
+from pymax import (
+    ApiError,
+    Client,
+    ExtraConfig,
+    File,
+    Message,
+    MessageDeleteEvent,
+    Photo,
+    Video,
+)
 from pymax.types.domain import (
     AudioAttachment,
     CallAttachment,
@@ -219,6 +228,7 @@ class Account:
         self._topic_lock = asyncio.Lock()
         self._warned_no_group = False
         self._diag_empty: set[int] = set()
+        self._sent_since_trim = 0
         self._register_max_handler()
 
     # ── имена ─────────────────────────────────────────────────────────────
@@ -352,6 +362,80 @@ class Account:
             except Exception:
                 logger.exception("[%s] Ошибка пересылки MAX->TG", self.name)
 
+        @self.client.on_message_edit()
+        async def on_max_edit(message: Message, client: Client) -> None:
+            try:
+                await self._mirror_edit(message)
+            except Exception:
+                logger.exception("[%s] Ошибка зеркалирования правки", self.name)
+
+        @self.client.on_message_delete()
+        async def on_max_delete(
+            event: MessageDeleteEvent, client: Client
+        ) -> None:
+            try:
+                await self._mirror_delete(event)
+            except Exception:
+                logger.exception("[%s] Ошибка зеркалирования удаления", self.name)
+
+    async def _mirror_edit(self, message: Message) -> None:
+        """Применяет правку сообщения MAX к его копии в Telegram."""
+        if self.group_id is None or message.chat_id is None:
+            return
+        rows = await self.storage.get_msg_map(message.id)
+        if not rows:
+            return
+        # Заново собираем заголовок + новый текст (медиа не трогаем).
+        chat = await self._get_chat(message.chat_id)
+        is_group = chat is not None and chat.type != ChatType.DIALOG
+        parts: list[str] = []
+        if is_group:
+            sender = (
+                await self._user_name(message.sender)
+                if message.sender else "?"
+            )
+            parts.append(f"👤 {sender}")
+        if message.text:
+            parts.append(message.text)
+        new_body = "\n".join(parts)
+
+        for tg_chat, tg_msg, role in rows:
+            if role == "text":
+                try:
+                    await self.bot.edit_message_text(
+                        new_body or "📭 (пусто)",
+                        chat_id=tg_chat, message_id=tg_msg,
+                    )
+                except Exception:
+                    logger.debug("edit_text не удался", exc_info=True)
+                return
+            if role == "caption":
+                try:
+                    await self.bot.edit_message_caption(
+                        chat_id=tg_chat, message_id=tg_msg,
+                        caption=new_body or None,
+                    )
+                except Exception:
+                    logger.debug("edit_caption не удался", exc_info=True)
+                return
+        # Носителя текста нет (например, альбом без подписи) — правку не
+        # применить, тихо пропускаем.
+
+    async def _mirror_delete(self, event: MessageDeleteEvent) -> None:
+        """Удаляет в Telegram копии удалённых в MAX сообщений."""
+        if self.group_id is None:
+            return
+        for max_msg_id in event.message_ids or []:
+            rows = await self.storage.get_msg_map(max_msg_id)
+            if not rows:
+                continue
+            for tg_chat, tg_msg, _role in rows:
+                try:
+                    await self.bot.delete_message(tg_chat, tg_msg)
+                except Exception:
+                    logger.debug("delete_message не удался", exc_info=True)
+            await self.storage.forget_msg(max_msg_id)
+
     async def _forward_to_telegram(self, message: Message) -> None:
         if message.sender is not None and message.sender == self._my_id():
             return
@@ -407,7 +491,10 @@ class Account:
             media = fwd_media + media
 
         body = "\n".join(parts)
-        sent_ids: list[int] = []
+        # records: (tg_message_id, role) — role ∈ {text, caption, media}.
+        # Для правок редактируем носитель текста (text/caption), для удалений —
+        # удаляем все.
+        records: list[tuple[int, str]] = []
 
         caption: str | None = body or None
         caption_used = False
@@ -416,7 +503,7 @@ class Account:
                 dest, body, message_thread_id=thread,
                 disable_notification=silent,
             )
-            sent_ids.append(sent.message_id)
+            records.append((sent.message_id, "text"))
             caption = None
             caption_used = True
 
@@ -425,6 +512,7 @@ class Account:
 
         if album:
             cap = None if caption_used else caption
+            role = "caption" if cap else "media"
             if len(album) == 1:
                 kind, filename, data = album[0]
                 file = BufferedInputFile(data, filename=filename)
@@ -438,7 +526,7 @@ class Account:
                         dest, file, caption=cap, message_thread_id=thread,
                         disable_notification=silent,
                     )
-                sent_ids.append(sent.message_id)
+                records.append((sent.message_id, role))
             else:
                 group: list[InputMediaPhoto | InputMediaVideo] = []
                 for index, (kind, filename, data) in enumerate(album):
@@ -452,7 +540,8 @@ class Account:
                     dest, group, message_thread_id=thread,
                     disable_notification=silent,
                 )
-                sent_ids.extend(m.message_id for m in msgs)
+                for i, m in enumerate(msgs):
+                    records.append((m.message_id, role if i == 0 else "media"))
             caption_used = True
 
         for kind, filename, data in others:
@@ -464,7 +553,7 @@ class Account:
                         dest, cap, message_thread_id=thread,
                         disable_notification=silent,
                     )
-                    sent_ids.append(pre.message_id)
+                    records.append((pre.message_id, "text"))
                 try:
                     sent = await self.bot.send_sticker(
                         dest, file, message_thread_id=thread,
@@ -475,22 +564,22 @@ class Account:
                         dest, file, message_thread_id=thread,
                         disable_notification=silent,
                     )
+                records.append((sent.message_id, "media"))
             elif kind == "audio":
                 sent = await self.bot.send_audio(
                     dest, file, caption=cap, message_thread_id=thread,
                     disable_notification=silent,
                 )
+                records.append((sent.message_id, "caption" if cap else "media"))
             else:
                 sent = await self.bot.send_document(
                     dest, file, caption=cap, message_thread_id=thread,
                     disable_notification=silent,
                 )
-            sent_ids.append(sent.message_id)
+                records.append((sent.message_id, "caption" if cap else "media"))
             caption_used = True
 
-        if not sent_ids:
-            # Диагностика: сообщение вышло пустым — покажем, какие «лишние»
-            # поля прислал MAX (там, вероятно, лежит пересланное/ответ).
+        if not records:
             if message.chat_id not in self._diag_empty:
                 self._diag_empty.add(message.chat_id)
                 try:
@@ -507,9 +596,17 @@ class Account:
                 dest, body or "📭 (пустое сообщение)",
                 message_thread_id=thread, disable_notification=silent,
             )
-            sent_ids.append(sent.message_id)
+            records.append((sent.message_id, "text"))
 
+        for mid, role in records:
+            await self.storage.remember_msg(
+                message.chat_id, message.id, dest, mid, role
+            )
         await self.storage.set_last_message(message.chat_id, message.id)
+        self._sent_since_trim += 1
+        if self._sent_since_trim >= 500:
+            self._sent_since_trim = 0
+            await self.storage.trim_msg_map(20000)
 
     async def _collect_incoming_media(
         self, message: Message

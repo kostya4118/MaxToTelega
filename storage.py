@@ -50,6 +50,22 @@ class Storage:
             )
             """
         )
+        await self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS msg_map (
+                rowid_alias    INTEGER PRIMARY KEY AUTOINCREMENT,
+                max_chat_id    INTEGER NOT NULL,
+                max_message_id INTEGER NOT NULL,
+                tg_chat_id     INTEGER NOT NULL,
+                tg_message_id  INTEGER NOT NULL,
+                role           TEXT NOT NULL
+            )
+            """
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_msg_map_max "
+            "ON msg_map (max_message_id)"
+        )
         # Миграция для баз, созданных до появления столбца title.
         try:
             await self._db.execute("ALTER TABLE topics ADD COLUMN title TEXT")
@@ -187,6 +203,55 @@ class Storage:
         if not row:
             return None
         return int(row[0]), (int(row[1]) if row[1] is not None else None)
+
+    # ── Связь сообщений MAX -> Telegram (для правок и удалений) ──────────
+
+    async def remember_msg(
+        self,
+        max_chat_id: int,
+        max_message_id: int,
+        tg_chat_id: int,
+        tg_message_id: int,
+        role: str,
+    ) -> None:
+        assert self._db is not None
+        await self._db.execute(
+            "INSERT INTO msg_map "
+            "(max_chat_id, max_message_id, tg_chat_id, tg_message_id, role) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (max_chat_id, max_message_id, tg_chat_id, tg_message_id, role),
+        )
+        await self._db.commit()
+
+    async def get_msg_map(
+        self, max_message_id: int
+    ) -> list[tuple[int, int, str]]:
+        """[(tg_chat_id, tg_message_id, role)] для сообщения MAX."""
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT tg_chat_id, tg_message_id, role FROM msg_map "
+            "WHERE max_message_id = ? ORDER BY rowid_alias",
+            (max_message_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [(int(r[0]), int(r[1]), str(r[2])) for r in rows]
+
+    async def forget_msg(self, max_message_id: int) -> None:
+        assert self._db is not None
+        await self._db.execute(
+            "DELETE FROM msg_map WHERE max_message_id = ?", (max_message_id,)
+        )
+        await self._db.commit()
+
+    async def trim_msg_map(self, keep: int) -> None:
+        """Оставляет последние keep записей, старые чистит (анти-разрастание)."""
+        assert self._db is not None
+        await self._db.execute(
+            "DELETE FROM msg_map WHERE rowid_alias <= "
+            "(SELECT MAX(rowid_alias) FROM msg_map) - ?",
+            (keep,),
+        )
+        await self._db.commit()
 
     async def close(self) -> None:
         if self._db is not None:
