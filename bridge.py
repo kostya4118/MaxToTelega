@@ -39,7 +39,6 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InputMediaPhoto,
     InputMediaVideo,
-    ReactionTypeEmoji,
 )
 from aiogram.types import Message as TgMessage
 
@@ -1033,13 +1032,8 @@ class Account:
             logger.warning("[%s] MAX отклонил отправку: %s", self.name, reason)
             await message.reply(f"⚠️ MAX не принял сообщение: {reason}")
             return
-        try:
-            await self.bot.set_message_reaction(
-                message.chat.id, message.message_id,
-                [ReactionTypeEmoji(emoji="👍")],
-            )
-        except Exception:
-            logger.debug("Не удалось поставить реакцию", exc_info=True)
+        # Успешная отправка — без подтверждения (👍 убрали). Об ошибке выше
+        # пользователь узнаёт отдельным ответом.
 
     async def _collect_outgoing_media(
         self, message: TgMessage
