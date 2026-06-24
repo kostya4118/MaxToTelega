@@ -26,6 +26,9 @@ from aiogram import Bot, Dispatcher
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     InputMediaPhoto,
     InputMediaVideo,
     ReactionTypeEmoji,
@@ -602,6 +605,10 @@ class Manager:
         self.by_group: dict[int, Account] = {}
         self.conv: dict[int, Conv] = {}
         self.pending_announce: set[int] = set()
+        # Модерация регистраций: админы одобряют новые аккаунты.
+        self.admin_ids: set[int] = set(config.admin_ids)
+        self.pending_reqs: dict[int, dict] = {}  # req_id -> {requester, phone}
+        self._req_counter = 0
         self._register_handlers()
 
     # ── ввод кода/пароля из диалога ───────────────────────────────────────
@@ -897,6 +904,14 @@ class Manager:
         async def cmd_muted(message: TgMessage) -> None:
             await self._route_command(message, "muted")
 
+        @dp.callback_query()
+        async def on_callback(cb: CallbackQuery) -> None:
+            data = cb.data or ""
+            if data.startswith("approve:") or data.startswith("deny:"):
+                await self._handle_approval(cb)
+            else:
+                await cb.answer()
+
         @dp.message()
         async def on_message(message: TgMessage) -> None:
             tg = message.from_user.id if message.from_user else None
@@ -914,6 +929,11 @@ class Manager:
                     and not conv.future.done()
                 ):
                     conv.future.set_result((message.text or "").strip())
+                    return
+                if conv.step == "waiting":
+                    await message.answer(
+                        "⏳ Твоя заявка ещё на рассмотрении у администратора."
+                    )
                     return
             # 2) сообщение в привязанной группе -> в MAX
             worker = self.by_group.get(message.chat.id)
@@ -961,14 +981,98 @@ class Manager:
                     "Этот номер уже подключён к боту. Один номер — один раз."
                 )
             return
-        name = f"MAX …{phone[-4:]}"
-        account_id = await self.registry.add(tg, name, phone, status="login")
-        self.conv[tg] = Conv(step="login", account_id=account_id)
-        self.pending_announce.add(account_id)
+        # Админ добавляет себе — без одобрения.
+        if tg in self.admin_ids:
+            await self._begin_login(tg, phone)
+            return
+        if not self.admin_ids:
+            self.conv.pop(tg, None)
+            await message.reply(
+                "Регистрация сейчас недоступна — не настроен администратор."
+            )
+            return
+
+        # Иначе — заявка на одобрение админу.
+        self._req_counter += 1
+        req_id = self._req_counter
+        self.pending_reqs[req_id] = {"requester": tg, "phone": phone}
+        self.conv[tg] = Conv(step="waiting")
         await message.answer(
-            "📲 Запускаю вход в MAX. Сейчас придёт SMS — пришли мне код сюда."
+            "⏳ Заявка отправлена администратору. Как одобрит — пришлю запрос "
+            "кода из SMS."
+        )
+        u = message.from_user
+        who = f"@{u.username}" if u.username else (u.full_name or f"id {tg}")
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="✅ Одобрить", callback_data=f"approve:{req_id}"
+            ),
+            InlineKeyboardButton(
+                text="❌ Отклонить", callback_data=f"deny:{req_id}"
+            ),
+        ]])
+        for admin in self.admin_ids:
+            try:
+                await self.bot.send_message(
+                    admin,
+                    "🆕 Запрос на добавление MAX-аккаунта\n"
+                    f"От: {who} (tg id {tg})\n"
+                    f"Телефон: {phone}",
+                    reply_markup=kb,
+                )
+            except Exception:
+                logger.debug("Не доставить заявку админу %s", admin)
+
+    async def _begin_login(self, requester_tg: int, phone: str) -> None:
+        """Создаёт аккаунт и запускает вход (после одобрения или для админа)."""
+        name = f"MAX …{phone[-4:]}"
+        account_id = await self.registry.add(
+            requester_tg, name, phone, status="login"
+        )
+        self.conv[requester_tg] = Conv(step="login", account_id=account_id)
+        self.pending_announce.add(account_id)
+        await self.bot.send_message(
+            requester_tg,
+            "📲 Запускаю вход в MAX. Сейчас придёт SMS — пришли мне код сюда.",
         )
         await self._start_account(account_id)
+
+    async def _handle_approval(self, cb: CallbackQuery) -> None:
+        if cb.from_user.id not in self.admin_ids:
+            await cb.answer("Это не для тебя.", show_alert=True)
+            return
+        action, _, rid = (cb.data or "").partition(":")
+        req = self.pending_reqs.pop(int(rid), None) if rid.isdigit() else None
+        if req is None:
+            await cb.answer("Заявка уже обработана или устарела.")
+            try:
+                await cb.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+        requester = req["requester"]
+        phone = req["phone"]
+        base = cb.message.text or "Заявка"
+        if action == "approve":
+            try:
+                await cb.message.edit_text(base + "\n\n✅ Одобрено")
+            except Exception:
+                pass
+            await cb.answer("Одобрено")
+            await self._begin_login(requester, phone)
+        else:
+            self.conv.pop(requester, None)
+            try:
+                await cb.message.edit_text(base + "\n\n❌ Отклонено")
+            except Exception:
+                pass
+            await cb.answer("Отклонено")
+            try:
+                await self.bot.send_message(
+                    requester, "❌ Заявка на добавление аккаунта отклонена."
+                )
+            except Exception:
+                pass
 
     # ── запуск ────────────────────────────────────────────────────────────
 

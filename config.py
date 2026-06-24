@@ -22,6 +22,7 @@ class Config:
     telegram_token: str
     work_dir: str
     registry_db: str
+    admin_ids: list[int]
 
     # Для одноразовой миграции старого single-аккаунта (если реестр пуст).
     legacy_owner_id: int | None
@@ -47,11 +48,25 @@ class Config:
 
         owner_raw = os.getenv("TELEGRAM_OWNER_ID", "").strip()
         group_raw = os.getenv("TELEGRAM_GROUP_ID", "").strip()
+        legacy_owner_id = int(owner_raw) if owner_raw else None
+
+        # Админы (одобряют регистрации). По умолчанию — владелец из .env.
+        admin_raw = os.getenv("ADMIN_TG_ID", "").strip()
+        if admin_raw:
+            admin_ids = [
+                int(x) for x in admin_raw.replace(";", ",").split(",")
+                if x.strip().lstrip("-").isdigit()
+            ]
+        elif legacy_owner_id is not None:
+            admin_ids = [legacy_owner_id]
+        else:
+            admin_ids = []
 
         return cls(
             telegram_token=token,
             work_dir=work_dir,
             registry_db=registry_db,
+            admin_ids=admin_ids,
             legacy_owner_id=int(owner_raw) if owner_raw else None,
             legacy_phone=(os.getenv("MAX_PHONE", "").strip() or None),
             legacy_group_id=int(group_raw) if group_raw else None,
