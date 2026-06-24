@@ -378,14 +378,14 @@ class Account:
             except Exception:
                 logger.exception("[%s] Ошибка пересылки MAX->TG", self.name)
 
-        @self.client.on_message_edit()
+        # Необязательные обработчики — есть не во всех версиях PyMax.
+        # Регистрируем, только если метод доступен (иначе просто пропускаем).
         async def on_max_edit(message: Message, client: Client) -> None:
             try:
                 await self._mirror_edit(message)
             except Exception:
                 logger.exception("[%s] Ошибка зеркалирования правки", self.name)
 
-        @self.client.on_message_delete()
         async def on_max_delete(
             event: MessageDeleteEvent, client: Client
         ) -> None:
@@ -394,13 +394,28 @@ class Account:
             except Exception:
                 logger.exception("[%s] Ошибка зеркалирования удаления", self.name)
 
-        @self.client.on_reaction_update()
         async def on_max_reaction(event, client: Client) -> None:
             try:
                 await self._mirror_reaction(event)
             except Exception:
                 logger.debug("[%s] Ошибка зеркалирования реакции",
                              self.name, exc_info=True)
+
+        self._register_optional("on_message_edit", on_max_edit)
+        self._register_optional("on_message_delete", on_max_delete)
+        self._register_optional("on_reaction_update", on_max_reaction)
+
+    def _register_optional(self, hook: str, handler) -> None:
+        """Регистрирует обработчик, если такой хук есть в этой версии PyMax."""
+        factory = getattr(self.client, hook, None)
+        if not callable(factory):
+            logger.debug("[%s] PyMax без %s — пропускаю", self.name, hook)
+            return
+        try:
+            factory()(handler)
+        except Exception:
+            logger.debug("[%s] Не удалось зарегистрировать %s",
+                         self.name, hook, exc_info=True)
 
     async def _mirror_edit(self, message: Message) -> None:
         """Применяет правку сообщения MAX к его копии в Telegram."""
