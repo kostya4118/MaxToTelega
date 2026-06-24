@@ -311,6 +311,7 @@ class Account:
         self._reaction_diag_done = False
         self._seen_opcodes: set[int] = set()
         self._last_chat_reaction: tuple | None = None
+        self._diag_attaches: set[str] = set()
         self._register_max_handler()
 
     # ── имена ─────────────────────────────────────────────────────────────
@@ -913,7 +914,11 @@ class Account:
                     else:
                         notes.append("🎤 голосовое / аудио")
                 elif isinstance(attach, ContactAttachment):
-                    notes.append("👤 контакт")
+                    nm = attach.name or " ".join(
+                        p for p in (attach.first_name, attach.last_name) if p
+                    )
+                    notes.append(f"👤 Контакт: {nm}" if nm else "👤 контакт")
+                    self._diag_attach(attach)
                 elif isinstance(attach, ShareAttachment):
                     notes.append("🔗 ссылка / репост")
                 elif isinstance(attach, CallAttachment):
@@ -921,14 +926,31 @@ class Account:
                 elif isinstance(attach, ControlAttachment):
                     notes.append("ℹ️ системное сообщение")
                 else:
-                    type_name = getattr(
-                        getattr(attach, "type", None), "value", "вложение"
+                    t = getattr(attach, "type", None)
+                    type_name = (
+                        t.value if hasattr(t, "value") else str(t or "вложение")
                     )
                     notes.append(f"📎 {type_name}")
+                    self._diag_attach(attach)
             except Exception:
                 logger.exception("Не удалось обработать вложение из MAX")
                 notes.append("📎 вложение (ошибка обработки)")
         return result, notes
+
+    def _diag_attach(self, attach) -> None:
+        """Один раз на тип логирует сырое вложение — чтобы отрисовать его потом."""
+        t = getattr(attach, "type", None)
+        key = t.value if hasattr(t, "value") else str(t)
+        if key in self._diag_attaches:
+            return
+        self._diag_attaches.add(key)
+        try:
+            logger.info(
+                "[%s] DIAG attach %s: %r",
+                self.name, key, str(attach.model_dump())[:900],
+            )
+        except Exception:
+            pass
 
     async def _collect_forward(
         self, message: Message
