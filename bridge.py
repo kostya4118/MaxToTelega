@@ -1039,6 +1039,15 @@ class Account:
                 max_chat_id, sent.id, message.chat.id, message.message_id,
                 "user",
             )
+            logger.info(
+                "[%s] исходящее сохранено: maxmsg=%s -> tg=%s",
+                self.name, sent.id, message.message_id,
+            )
+        else:
+            logger.info(
+                "[%s] send_message не вернул id — связь не сохранена",
+                self.name,
+            )
         # Успешная отправка — без подтверждения (👍 убрали). Об ошибке выше
         # пользователь узнаёт отдельным ответом.
 
