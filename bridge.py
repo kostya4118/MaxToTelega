@@ -536,6 +536,10 @@ class Account:
             return
         target = await self.storage.get_reaction_target(max_msg_id)
         if target is None:
+            logger.info(
+                "[%s] реакция msg=%s — нет несущей копии (старое/медиа-сообщение)",
+                self.name, max_msg_id,
+            )
             return
         tg_chat, tg_msg, role, body = target
 
