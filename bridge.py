@@ -524,43 +524,50 @@ class Account:
         return c.get(key) if isinstance(c, dict) else getattr(c, key, None)
 
     async def _apply_reaction(self, message_id, counters, total_count) -> None:
-        """Ставит доминирующую реакцию MAX на копию сообщения в Telegram."""
+        """Показывает реакции MAX, дописывая их подписью к копии сообщения.
+
+        Бот не может видимо «отреагировать» на собственное сообщение, поэтому
+        реакции добавляются строкой в конец текста/подписи (с количеством).
+        """
         if self.group_id is None or message_id is None:
             return
         try:
             max_msg_id = int(message_id)
         except (TypeError, ValueError):
             return
-        rows = await self.storage.get_msg_map(max_msg_id)
-        if not rows:
+        target = await self.storage.get_reaction_target(max_msg_id)
+        if target is None:
             return
-        # Носитель: текст/подпись, иначе первое.
-        target = next(
-            ((c, m) for c, m, role in rows if role in ("text", "caption")),
-            (rows[0][0], rows[0][1]),
-        )
-        reactions: list[ReactionTypeEmoji] = []
-        emoji = ""
-        counters = counters or []
-        if counters and total_count:
-            top = max(counters, key=lambda c: self._counter_field(c, "count") or 0)
-            emoji = (self._counter_field(top, "reaction") or "").strip()
+        tg_chat, tg_msg, role, body = target
+
+        # Собираем строку реакций: «❤️2 🤣1».
+        chips = []
+        for c in counters or []:
+            emoji = (self._counter_field(c, "reaction") or "").strip()
+            cnt = self._counter_field(c, "count") or 0
             if emoji:
-                reactions = [ReactionTypeEmoji(emoji=emoji)]
+                chips.append(f"{emoji}{cnt}" if cnt > 1 else emoji)
+        footer = " ".join(chips)
+        base = body or ""
+        new_text = base + (f"\n{footer}" if footer else "")
         logger.info(
-            "[%s] реакция msg=%s emoji=%r total=%s -> копий %s",
-            self.name, max_msg_id, emoji, total_count, len(rows),
+            "[%s] реакции msg=%s -> %r", self.name, max_msg_id, footer
         )
         try:
-            # Если emoji не из разрешённого Telegram набора — просто пропустим.
-            await self.bot.set_message_reaction(target[0], target[1], reactions)
-        except Exception as e:
-            # Снятие реакции, когда снимать нечего, — безобидно (REACTION_EMPTY).
-            if not reactions and "EMPTY" in str(e).upper():
-                logger.debug("нечего снимать (реакция уже пуста)")
+            if role == "caption":
+                await self.bot.edit_message_caption(
+                    chat_id=tg_chat, message_id=tg_msg,
+                    caption=new_text or None,
+                )
             else:
-                logger.info("[%s] set_message_reaction(%r) не прошёл: %s",
-                            self.name, emoji, e)
+                await self.bot.edit_message_text(
+                    new_text or "📭", chat_id=tg_chat, message_id=tg_msg,
+                )
+        except TelegramBadRequest as e:
+            if "not modified" not in str(e).lower():
+                logger.info("[%s] правка реакций не прошла: %s", self.name, e)
+        except Exception:
+            logger.debug("правка реакций не прошла", exc_info=True)
 
     async def _handle_raw_reaction(self, payload: dict) -> None:
         """Разбирает фрейм реакции (опкод 156): messageId + reactionInfo."""
@@ -777,8 +784,10 @@ class Account:
             records.append((sent.message_id, "text"))
 
         for mid, role in records:
+            # Текст храним у несущей роли — чтобы потом дописать реакции.
             await self.storage.remember_msg(
-                message.chat_id, message.id, dest, mid, role
+                message.chat_id, message.id, dest, mid, role,
+                body=(body if role in ("text", "caption") else None),
             )
         await self.storage.set_last_message(message.chat_id, message.id)
         self._sent_since_trim += 1

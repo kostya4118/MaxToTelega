@@ -58,10 +58,15 @@ class Storage:
                 max_message_id INTEGER NOT NULL,
                 tg_chat_id     INTEGER NOT NULL,
                 tg_message_id  INTEGER NOT NULL,
-                role           TEXT NOT NULL
+                role           TEXT NOT NULL,
+                body           TEXT
             )
             """
         )
+        try:
+            await self._db.execute("ALTER TABLE msg_map ADD COLUMN body TEXT")
+        except Exception:
+            pass  # столбец уже есть
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_msg_map_max "
             "ON msg_map (max_message_id)"
@@ -221,15 +226,32 @@ class Storage:
         tg_chat_id: int,
         tg_message_id: int,
         role: str,
+        body: str | None = None,
     ) -> None:
         assert self._db is not None
         await self._db.execute(
             "INSERT INTO msg_map "
-            "(max_chat_id, max_message_id, tg_chat_id, tg_message_id, role) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (max_chat_id, max_message_id, tg_chat_id, tg_message_id, role),
+            "(max_chat_id, max_message_id, tg_chat_id, tg_message_id, role, "
+            " body) VALUES (?, ?, ?, ?, ?, ?)",
+            (max_chat_id, max_message_id, tg_chat_id, tg_message_id, role, body),
         )
         await self._db.commit()
+
+    async def get_reaction_target(
+        self, max_message_id: int
+    ) -> tuple[int, int, str, str | None] | None:
+        """Несущее текст/подпись сообщение для правок реакций: (chat, msg, role, body)."""
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT tg_chat_id, tg_message_id, role, body FROM msg_map "
+            "WHERE max_message_id = ? AND role IN ('text','caption') "
+            "ORDER BY rowid_alias LIMIT 1",
+            (max_message_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return None
+        return int(row[0]), int(row[1]), str(row[2]), row[3]
 
     async def get_msg_map(
         self, max_message_id: int
