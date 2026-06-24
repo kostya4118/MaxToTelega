@@ -429,11 +429,9 @@ class Account:
             try:
                 op = getattr(frame, "opcode", None)
                 payload = getattr(frame, "payload", None) or {}
-                # Диагностика: реакционные опкоды (135/156) логируем всегда,
-                # остальные — один раз на тип.
-                if op in (135, 156) or op not in self._seen_opcodes:
+                if op not in self._seen_opcodes:
                     self._seen_opcodes.add(op)
-                    logger.info(
+                    logger.debug(
                         "[%s] raw opcode=%s payload=%r",
                         self.name, op, str(payload)[:600],
                     )
@@ -543,7 +541,7 @@ class Account:
             return
         target = await self.storage.get_reaction_target(max_msg_id)
         if target is None:
-            logger.info(
+            logger.debug(
                 "[%s] реакция msg=%s — нет несущей копии (старое/медиа-сообщение)",
                 self.name, max_msg_id,
             )
@@ -559,7 +557,7 @@ class Account:
             if emoji and cnt > best:
                 best, dominant = cnt, emoji
         reactions = [ReactionTypeEmoji(emoji=dominant)] if dominant else []
-        logger.info(
+        logger.debug(
             "[%s] реакция msg=%s role=%s emoji=%r",
             self.name, max_msg_id, role, dominant,
         )
@@ -797,7 +795,7 @@ class Account:
                 self._diag_empty.add(message.chat_id)
                 try:
                     extra = getattr(message, "model_extra", None) or {}
-                    logger.info(
+                    logger.debug(
                         "[%s] DIAG пустое сообщение chat=%s type=%s "
                         "extra_keys=%s reaction_info=%r link=%r",
                         self.name, message.chat_id, message.type,
@@ -1081,12 +1079,12 @@ class Account:
                 max_chat_id, sent.id, message.chat.id, message.message_id,
                 "user",
             )
-            logger.info(
+            logger.debug(
                 "[%s] исходящее сохранено: maxmsg=%s -> tg=%s",
                 self.name, sent.id, message.message_id,
             )
         else:
-            logger.info(
+            logger.debug(
                 "[%s] send_message не вернул id — связь не сохранена",
                 self.name,
             )
