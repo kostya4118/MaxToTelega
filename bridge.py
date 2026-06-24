@@ -528,14 +528,18 @@ class Account:
         if ntext:
             parts.append(ntext)
 
-        media, notes = await self._collect_nested_media(nested)
+        src_chat_id = link.get("chatId")
+        src_msg_id = nested.get("id")
+        media, notes = await self._collect_nested_media(
+            nested, src_chat_id, src_msg_id
+        )
         parts.extend(notes)
         return media, parts
 
     async def _collect_nested_media(
-        self, nested: dict
+        self, nested: dict, src_chat_id, src_msg_id
     ) -> tuple[list[tuple[str, str, bytes]], list[str]]:
-        """Вложения вложенного (пересланного) сообщения — только по прямым URL."""
+        """Вложения вложенного (пересланного) сообщения."""
         result: list[tuple[str, str, bytes]] = []
         notes: list[str] = []
         for a in nested.get("attaches", []) or []:
@@ -555,10 +559,24 @@ class Account:
                     data = await self._download(a["url"])
                     if data:
                         result.append(("audio", "audio.mp3", data))
-                elif t == "VIDEO":
-                    notes.append("🎬 видео")
                 elif t == "FILE":
-                    notes.append(f"📎 файл: {a.get('name') or 'без имени'}")
+                    data = await self._fetch_by_id(
+                        "file", src_chat_id, src_msg_id, a.get("fileId")
+                    )
+                    if data:
+                        result.append(
+                            ("document", a.get("name") or "file", data)
+                        )
+                    else:
+                        notes.append(f"📎 файл: {a.get('name') or 'без имени'}")
+                elif t == "VIDEO":
+                    data = await self._fetch_by_id(
+                        "video", src_chat_id, src_msg_id, a.get("videoId")
+                    )
+                    if data:
+                        result.append(("video", "video.mp4", data))
+                    else:
+                        notes.append("🎬 видео")
                 elif t == "SHARE":
                     notes.append("🔗 ссылка / репост")
                 elif t:
@@ -567,6 +585,25 @@ class Account:
                 logger.exception("Вложение пересланного не обработано")
                 notes.append("📎 вложение")
         return result, notes
+
+    async def _fetch_by_id(self, kind, chat_id, msg_id, attach_id) -> bytes | None:
+        """Тянет файл/видео пересланного по его родному чату (если есть доступ)."""
+        if not (chat_id and msg_id and attach_id):
+            return None
+        try:
+            if kind == "file":
+                info = await self.client.get_file_by_id(
+                    chat_id, msg_id, attach_id
+                )
+            else:
+                info = await self.client.get_video_by_id(
+                    chat_id, msg_id, attach_id
+                )
+            if info and info.url:
+                return await self._download(info.url)
+        except Exception:
+            logger.debug("forward %s fetch failed", kind, exc_info=True)
+        return None
 
     async def _download(self, url: str) -> bytes | None:
         async with self.http.get(url) as resp:
