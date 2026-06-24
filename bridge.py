@@ -597,6 +597,11 @@ class Account:
         mid = chat.get("lastReactedMessageId")
         reaction = (chat.get("lastReaction") or "").strip()
         if mid is None:
+            # Поля очищены — реакцию сняли. Снимаем с предыдущего сообщения.
+            if self._last_chat_reaction is not None:
+                prev_mid, _ = self._last_chat_reaction
+                self._last_chat_reaction = None
+                await self._apply_reaction(prev_mid, [], 0)
             return
         # Опкод 135 приходит и не на реакции — дедуп по (msg, эмодзи).
         key = (mid, reaction)
@@ -1001,34 +1006,14 @@ class Account:
             await message.reply("⚠️ Не удалось отправить в MAX (см. логи).")
 
     async def handle_tg_reaction(self, tg_message_id, new_reaction) -> None:
-        """Реакция владельца в Telegram → ставит/снимает её в MAX."""
-        if self.group_id is None or not self._max_online():
-            return
-        target = await self.storage.max_msg_by_tg(self.group_id, tg_message_id)
-        if target is None:
-            return
-        max_chat_id, max_message_id = target
-        emoji = None
-        for r in new_reaction or []:
-            e = getattr(r, "emoji", None)
-            if e:
-                emoji = e
-                break
-        try:
-            if emoji:
-                await self.client.add_reaction(
-                    max_chat_id, str(max_message_id), emoji
-                )
-            else:
-                await self.client.remove_reaction(
-                    max_chat_id, str(max_message_id)
-                )
-            logger.info(
-                "[%s] реакция TG->MAX msg=%s emoji=%r",
-                self.name, max_message_id, emoji,
-            )
-        except Exception as e:
-            logger.info("[%s] реакцию в MAX не поставить: %s", self.name, e)
+        """TG → MAX реакции ОТКЛЮЧЕНЫ.
+
+        Текущая версия MAX отвергает add_reaction/remove_reaction с ошибкой
+        proto.payload («Expected number at 24» — id сообщения уходит строкой,
+        а сервер ждёт число) и РАЗРЫВАЕТ соединение — как и read_message.
+        Пока в PyMax/MAX это не починят, отправку реакций в MAX не делаем.
+        """
+        return
 
     async def _target_for(self, message: TgMessage) -> tuple[int | None, int | None]:
         thread = message.message_thread_id
