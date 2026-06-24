@@ -555,8 +555,12 @@ class Account:
             # Если emoji не из разрешённого Telegram набора — просто пропустим.
             await self.bot.set_message_reaction(target[0], target[1], reactions)
         except Exception as e:
-            logger.info("[%s] set_message_reaction(%r) не прошёл: %s",
-                        self.name, emoji, e)
+            # Снятие реакции, когда снимать нечего, — безобидно (REACTION_EMPTY).
+            if not reactions and "EMPTY" in str(e).upper():
+                logger.debug("нечего снимать (реакция уже пуста)")
+            else:
+                logger.info("[%s] set_message_reaction(%r) не прошёл: %s",
+                            self.name, emoji, e)
 
     async def _handle_raw_reaction(self, payload: dict) -> None:
         """Разбирает фрейм реакции (опкод 156): messageId + reactionInfo."""
