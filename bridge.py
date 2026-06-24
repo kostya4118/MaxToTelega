@@ -164,6 +164,37 @@ async def _retry_after_middleware(make_request, bot, method):
     return await make_request(bot, method)
 
 
+_ENC_MAGIC = b"MTTENC1\n"
+
+
+def _derive_key(passphrase: str, salt: bytes) -> bytes:
+    import base64
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(), length=32, salt=salt, iterations=200_000
+    )
+    return base64.urlsafe_b64encode(kdf.derive(passphrase.encode("utf-8")))
+
+
+def _encrypt_file(path: str, passphrase: str) -> str:
+    """Шифрует файл паролем (PBKDF2 + Fernet). Возвращает путь к .enc."""
+    from cryptography.fernet import Fernet
+
+    salt = os.urandom(16)
+    token = Fernet(_derive_key(passphrase, salt)).encrypt(
+        open(path, "rb").read()
+    )
+    enc = path + ".enc"
+    with open(enc, "wb") as f:
+        f.write(_ENC_MAGIC)
+        f.write(salt)
+        f.write(token)
+    os.remove(path)
+    return enc
+
+
 def _sqlite_snapshot(src: str, dst: str) -> None:
     """Консистентная копия SQLite-файла даже при открытом соединении."""
     source = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
@@ -177,8 +208,13 @@ def _sqlite_snapshot(src: str, dst: str) -> None:
         source.close()
 
 
-def _build_backup(work_dir: str, backup_dir: str, keep: int) -> str:
-    """Собирает tar.gz из всех *.db (сессии, реестр, маршрутизация). Ротирует."""
+def _build_backup(
+    work_dir: str, backup_dir: str, keep: int, passphrase: str | None = None
+) -> str:
+    """Собирает tar.gz из всех *.db (сессии, реестр, маршрутизация). Ротирует.
+
+    Если задан passphrase — архив шифруется (на выходе .tar.gz.enc).
+    """
     os.makedirs(backup_dir, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     archive = os.path.join(backup_dir, f"backup_{ts}.tar.gz")
@@ -192,9 +228,19 @@ def _build_backup(work_dir: str, backup_dir: str, keep: int) -> str:
                 shutil.copy2(src, dst)
         with tarfile.open(archive, "w:gz") as tar:
             tar.add(tmp, arcname="data")
-    # Ротация: оставляем последние keep архивов.
+    if passphrase:
+        try:
+            archive = _encrypt_file(archive, passphrase)
+        except Exception:
+            logger.warning(
+                "Не удалось зашифровать бэкап — оставляю без шифрования",
+                exc_info=True,
+            )
+    # Ротация: оставляем последние keep архивов (с .enc или без).
     if keep > 0:
-        backups = sorted(glob.glob(os.path.join(backup_dir, "backup_*.tar.gz")))
+        backups = sorted(
+            glob.glob(os.path.join(backup_dir, "backup_*.tar.gz*"))
+        )
         for old in backups[:-keep]:
             try:
                 os.remove(old)
@@ -1803,6 +1849,7 @@ class Manager:
             self.config.work_dir,
             self.config.backup_dir,
             self.config.backup_keep,
+            self.config.backup_passphrase,
         )
 
     async def _backup_loop(self) -> None:

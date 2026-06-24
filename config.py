@@ -29,6 +29,7 @@ class Config:
     backup_dir: str
     backup_interval: int       # часы между авто-бэкапами (0 — выкл)
     backup_keep: int           # сколько последних бэкапов хранить
+    backup_passphrase: str | None  # если задан — бэкапы шифруются
 
     # Для одноразовой миграции старого single-аккаунта (если реестр пуст).
     legacy_owner_id: int | None
@@ -85,6 +86,7 @@ class Config:
             ).strip(),
             backup_interval=_int("BACKUP_INTERVAL_HOURS", 24),
             backup_keep=_int("BACKUP_KEEP", 7),
+            backup_passphrase=(os.getenv("BACKUP_PASSPHRASE", "").strip() or None),
             legacy_owner_id=int(owner_raw) if owner_raw else None,
             legacy_phone=(os.getenv("MAX_PHONE", "").strip() or None),
             legacy_group_id=int(group_raw) if group_raw else None,

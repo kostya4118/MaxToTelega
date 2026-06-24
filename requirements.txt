@@ -8,3 +8,5 @@ aiosqlite>=0.20
 aiohttp>=3.9
 # Конфигурация из .env
 python-dotenv>=1.0
+# Шифрование бэкапов (если задан BACKUP_PASSPHRASE)
+cryptography>=42.0
