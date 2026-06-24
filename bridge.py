@@ -16,11 +16,16 @@
 from __future__ import annotations
 
 import asyncio
+import glob
 import logging
 import os
 import re
+import sqlite3
+import tarfile
+import tempfile
 import time
 from dataclasses import dataclass
+from datetime import datetime
 
 import aiohttp
 from aiogram import Bot, Dispatcher
@@ -28,6 +33,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
@@ -113,6 +119,46 @@ if _LOG_FILE:
 TG_CAPTION_LIMIT = 1024
 PHONE_RE = re.compile(r"^\+\d{7,15}$")
 AUTH_TIMEOUT = 300  # сек на ввод кода/пароля
+TG_UPLOAD_LIMIT = 45 * 1024 * 1024  # запас под лимит бота Telegram (~50 МБ)
+
+
+def _sqlite_snapshot(src: str, dst: str) -> None:
+    """Консистентная копия SQLite-файла даже при открытом соединении."""
+    source = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+    try:
+        target = sqlite3.connect(dst)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+    finally:
+        source.close()
+
+
+def _build_backup(work_dir: str, backup_dir: str, keep: int) -> str:
+    """Собирает tar.gz из всех *.db (сессии, реестр, маршрутизация). Ротирует."""
+    os.makedirs(backup_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive = os.path.join(backup_dir, f"backup_{ts}.tar.gz")
+    with tempfile.TemporaryDirectory() as tmp:
+        for src in glob.glob(os.path.join(work_dir, "*.db")):
+            dst = os.path.join(tmp, os.path.basename(src))
+            try:
+                _sqlite_snapshot(src, dst)
+            except Exception:
+                import shutil
+                shutil.copy2(src, dst)
+        with tarfile.open(archive, "w:gz") as tar:
+            tar.add(tmp, arcname="data")
+    # Ротация: оставляем последние keep архивов.
+    if keep > 0:
+        backups = sorted(glob.glob(os.path.join(backup_dir, "backup_*.tar.gz")))
+        for old in backups[:-keep]:
+            try:
+                os.remove(old)
+            except Exception:
+                pass
+    return archive
 
 
 @dataclass
@@ -1260,6 +1306,30 @@ class Manager:
                 "🚫 Забанены:\n" + "\n".join(str(i) for i in ids)
             )
 
+        @dp.message(Command("backup"))
+        async def cmd_backup(message: TgMessage) -> None:
+            if message.from_user.id not in self.admin_ids:
+                return
+            await message.reply("📦 Делаю бэкап…")
+            try:
+                path = await self._backup_now()
+            except Exception as e:
+                logger.exception("Бэкап не удался")
+                await message.reply(f"❌ Бэкап не удался: {e}")
+                return
+            size = os.path.getsize(path)
+            if size <= TG_UPLOAD_LIMIT:
+                await message.answer_document(
+                    FSInputFile(path),
+                    caption=f"📦 Бэкап ({size // 1024} КБ)",
+                )
+            else:
+                await message.reply(
+                    f"✅ Бэкап сохранён на сервере:\n{path}\n"
+                    f"({size // 1024 // 1024} МБ — слишком большой для отправки "
+                    "в Telegram, скопируй с сервера вручную)."
+                )
+
         @dp.callback_query()
         async def on_callback(cb: CallbackQuery) -> None:
             data = cb.data or ""
@@ -1374,6 +1444,28 @@ class Manager:
         elif action == "remove":
             await self._cleanup_account(account_id, delete=True)
             await message.reply(f"🗑 Аккаунт #{account_id} удалён.")
+
+    # ── бэкап ─────────────────────────────────────────────────────────────
+
+    async def _backup_now(self) -> str:
+        return await asyncio.to_thread(
+            _build_backup,
+            self.config.work_dir,
+            self.config.backup_dir,
+            self.config.backup_keep,
+        )
+
+    async def _backup_loop(self) -> None:
+        hours = self.config.backup_interval
+        if hours <= 0:
+            return
+        while True:
+            await asyncio.sleep(hours * 3600)
+            try:
+                path = await self._backup_now()
+                logger.info("Авто-бэкап создан: %s", path)
+            except Exception:
+                logger.exception("Авто-бэкап не удался")
 
     async def _on_phone(self, message: TgMessage) -> None:
         tg = message.from_user.id
@@ -1522,12 +1614,17 @@ class Manager:
             await self._start_account(acc["id"])
         logger.info("Поднято аккаунтов: %d", len(self.workers))
 
+        backup_task = asyncio.create_task(self._backup_loop(), name="backup")
+
         try:
             await self.dp.start_polling(self.bot)
         finally:
+            backup_task.cancel()
             for task in list(self.tasks.values()):
                 task.cancel()
-            await asyncio.gather(*self.tasks.values(), return_exceptions=True)
+            await asyncio.gather(
+                backup_task, *self.tasks.values(), return_exceptions=True
+            )
             await self.http.close()
             for worker in self.workers.values():
                 try:

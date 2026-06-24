@@ -26,6 +26,9 @@ class Config:
     add_cooldown: int          # сек между попытками /add
     add_per_hour: int          # макс. регистраций в час на пользователя
     max_accounts: int          # макс. аккаунтов на пользователя
+    backup_dir: str
+    backup_interval: int       # часы между авто-бэкапами (0 — выкл)
+    backup_keep: int           # сколько последних бэкапов хранить
 
     # Для одноразовой миграции старого single-аккаунта (если реестр пуст).
     legacy_owner_id: int | None
@@ -77,6 +80,11 @@ class Config:
             add_cooldown=_int("ADD_COOLDOWN_SEC", 30),
             add_per_hour=_int("ADD_MAX_PER_HOUR", 5),
             max_accounts=_int("MAX_ACCOUNTS_PER_USER", 5),
+            backup_dir=os.getenv(
+                "BACKUP_DIR", os.path.join(work_dir, "backups")
+            ).strip(),
+            backup_interval=_int("BACKUP_INTERVAL_HOURS", 24),
+            backup_keep=_int("BACKUP_KEEP", 7),
             legacy_owner_id=int(owner_raw) if owner_raw else None,
             legacy_phone=(os.getenv("MAX_PHONE", "").strip() or None),
             legacy_group_id=int(group_raw) if group_raw else None,
