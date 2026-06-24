@@ -435,7 +435,7 @@ class Account:
                         "[%s] raw opcode=%s payload=%r",
                         self.name, op, str(payload)[:600],
                     )
-                if op == 155:
+                if op in (155, 156):
                     await self._handle_raw_reaction(payload)
             except Exception:
                 logger.debug("[%s] raw-обработка не удалась",
@@ -559,32 +559,15 @@ class Account:
                         self.name, emoji, e)
 
     async def _handle_raw_reaction(self, payload: dict) -> None:
-        """Разбирает сырой payload опкода 155 и зеркалит реакцию."""
-        if not self._reaction_diag_done:
-            self._reaction_diag_done = True
-            logger.info(
-                "[%s] DIAG reaction payload: %r", self.name, str(payload)[:800]
-            )
-        info = payload
-        if not (isinstance(info, dict) and ("messageId" in info or "chatId" in info)):
-            for key in ("reactionInfo", "message", "reactions"):
-                v = payload.get(key) if isinstance(payload, dict) else None
-                if isinstance(v, dict):
-                    info = v
-                    break
-        if not isinstance(info, dict):
+        """Разбирает фрейм реакции (опкод 156): messageId + reactionInfo."""
+        if not isinstance(payload, dict):
             return
-        message_id = info.get("messageId") or payload.get("messageId")
-        counters = (
-            info.get("counters")
-            or (info.get("reactionInfo") or {}).get("counters")
-            or payload.get("counters")
-        )
-        total = (
-            info.get("totalCount")
-            or payload.get("totalCount")
-            or (len(counters) if counters else 0)
-        )
+        message_id = payload.get("messageId")
+        ri = payload.get("reactionInfo")
+        if not isinstance(ri, dict):
+            ri = {}
+        counters = ri.get("counters") or []
+        total = ri.get("totalCount") or 0
         await self._apply_reaction(message_id, counters, total)
 
     async def _forward_to_telegram(self, message: Message) -> None:
