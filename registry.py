@@ -81,6 +81,13 @@ class Registry:
         )
         await self._db.commit()
 
+    async def set_proxy(self, account_id: int, proxy: str | None) -> None:
+        assert self._db is not None
+        await self._db.execute(
+            "UPDATE accounts SET proxy = ? WHERE id = ?", (proxy, account_id)
+        )
+        await self._db.commit()
+
     async def set_name(self, account_id: int, name: str) -> None:
         assert self._db is not None
         await self._db.execute(

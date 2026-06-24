@@ -834,13 +834,16 @@ class Manager:
         if account_id in self.pending_announce:
             self.pending_announce.discard(account_id)
             self.conv.pop(worker.owner_tg_id, None)
-            await self.bot.send_message(
-                worker.owner_tg_id,
-                f"✅ Аккаунт «{worker.name}» вошёл в MAX!\n\n"
-                "Теперь создай группу-форум, добавь меня админом с правом "
-                "«Управление темами», и напиши в группе /bind — привяжу её к "
-                "этому аккаунту.",
-            )
+            if worker.group_id is None:
+                text = (
+                    f"✅ Аккаунт «{worker.name}» вошёл в MAX!\n\n"
+                    "Теперь создай группу-форум, добавь меня админом с правом "
+                    "«Управление темами», и напиши в группе /bind — привяжу её "
+                    "к этому аккаунту."
+                )
+            else:
+                text = f"✅ Аккаунт «{worker.name}» снова на связи."
+            await self.bot.send_message(worker.owner_tg_id, text)
 
     def _on_client_done(self, account_id: int, task: asyncio.Task) -> None:
         if task.cancelled():
@@ -849,34 +852,53 @@ class Manager:
         asyncio.create_task(self._account_stopped(account_id, exc))
 
     async def _account_stopped(self, account_id: int, exc) -> None:
+        acc = await self.registry.get(account_id)
         worker = self.workers.get(account_id)
-        owner = worker.owner_tg_id if worker else None
-        name = worker.name if worker else f"MAX {account_id}"
-        if account_id in self.pending_announce:
-            # упал во время онбординга — откатываем
-            self.pending_announce.discard(account_id)
-            if owner:
-                self.conv.pop(owner, None)
-                try:
-                    await self.bot.send_message(
-                        owner, f"❌ Вход не удался: {exc}. Попробуй заново: /add"
-                    )
-                except Exception:
-                    pass
-            await self._cleanup_account(account_id, delete=True)
+        owner = (worker.owner_tg_id if worker else None) or (
+            acc["owner_tg_id"] if acc else None
+        )
+        name = (worker.name if worker else None) or (
+            acc["name"] if acc else f"MAX {account_id}"
+        )
+        onboarding = account_id in self.pending_announce
+        self.pending_announce.discard(account_id)
+        # Аккаунт НЕ удаляем — оставляем, чтобы можно было задать прокси и
+        # повторить вход (/setproxy, /relogin) или удалить вручную (/remove).
+        await self._cleanup_account(account_id, delete=False)
+        if acc is not None:
+            await self.registry.set_status(
+                account_id, "failed" if onboarding else "stopped"
+            )
+        if not owner:
+            return
+        if onboarding:
+            self.conv.pop(owner, None)
+            text = (
+                f"❌ Вход в MAX не удался: {exc}\n\n"
+                "• Если ты в другой стране — задай прокси своего региона и "
+                "повтори вход:\n"
+                f"   /setproxy {account_id} http://user:pass@ip:port\n"
+                f"   /relogin {account_id}\n"
+                f"• Или удали заявку: /remove {account_id}"
+            )
         else:
-            if exc is not None:
-                logger.error("Аккаунт '%s' остановился: %r", name, exc)
-                if owner:
-                    try:
-                        await self.bot.send_message(
-                            owner,
-                            f"⚠️ Аккаунт «{name}» остановился. Если MAX "
-                            "разлогинил сессию — добавь заново через /add.",
-                        )
-                    except Exception:
-                        pass
-            await self._cleanup_account(account_id, delete=False)
+            logger.error("Аккаунт '%s' остановился: %r", name, exc)
+            text = (
+                f"⚠️ Аккаунт «{name}» остановился (возможно, MAX сбросил "
+                f"сессию). Перезапустить вход: /relogin {account_id} "
+                f"(или удалить: /remove {account_id})."
+            )
+        try:
+            await self.bot.send_message(owner, text)
+        except Exception:
+            pass
+
+    async def _restart_account(self, account_id: int, *, announce: bool) -> None:
+        """Останавливает и заново запускает аккаунт (после смены прокси и т.п.)."""
+        await self._cleanup_account(account_id, delete=False)
+        if announce:
+            self.pending_announce.add(account_id)
+        await self._start_account(account_id)
 
     async def _cleanup_account(self, account_id: int, *, delete: bool) -> None:
         task = self.tasks.pop(account_id, None)
@@ -919,11 +941,72 @@ class Manager:
                 "Привет! Я зеркалю переписку MAX в Telegram.\n\n"
                 "*/add* — добавить MAX-аккаунт (спрошу телефон и код из SMS)\n"
                 "*/accounts* — твои аккаунты\n"
-                "*/remove N* — удалить аккаунт\n\n"
+                "*/remove N* — удалить аккаунт\n"
+                "*/setproxy N <url>* — задать прокси (или off — убрать)\n"
+                "*/relogin N* — повторить вход (после прокси / сброса сессии)\n\n"
                 "У каждого аккаунта — своя группа-форум: после /add создаёшь "
                 "группу, добавляешь меня админом и пишешь там /bind.",
                 parse_mode="Markdown",
             )
+
+        @dp.message(Command("setproxy"))
+        async def cmd_setproxy(
+            message: TgMessage, command: CommandObject
+        ) -> None:
+            if message.chat.type != "private":
+                await message.reply("Команду /setproxy шли в личке.")
+                return
+            tg = message.from_user.id
+            args = (command.args or "").split(maxsplit=1)
+            if not args or not args[0].isdigit():
+                await message.reply(
+                    "Использование:\n"
+                    "/setproxy N http://user:pass@ip:port\n"
+                    "/setproxy N off — убрать прокси"
+                )
+                return
+            account_id = int(args[0])
+            acc = await self.registry.get(account_id)
+            if acc is None or acc["owner_tg_id"] != tg:
+                await message.reply("Нет такого аккаунта среди твоих.")
+                return
+            raw = args[1].strip() if len(args) > 1 else ""
+            if raw.lower() in ("", "off", "none", "-"):
+                proxy = None
+            elif re.match(r"^(https?|socks5|socks4)://", raw):
+                proxy = raw
+            else:
+                await message.reply(
+                    "Прокси должен начинаться с http://, https:// или socks5://"
+                )
+                return
+            await self.registry.set_proxy(account_id, proxy)
+            await message.reply(
+                f"🌐 Прокси для #{account_id} "
+                f"{'убран' if proxy is None else 'сохранён'}. Перезапускаю "
+                "аккаунт — если потребуется вход, пришлю запрос кода."
+            )
+            await self._restart_account(account_id, announce=True)
+
+        @dp.message(Command("relogin"))
+        async def cmd_relogin(
+            message: TgMessage, command: CommandObject
+        ) -> None:
+            if message.chat.type != "private":
+                await message.reply("Команду /relogin шли в личке.")
+                return
+            tg = message.from_user.id
+            arg = (command.args or "").strip()
+            if not arg.isdigit():
+                await message.reply("Использование: /relogin N (номер из /accounts)")
+                return
+            account_id = int(arg)
+            acc = await self.registry.get(account_id)
+            if acc is None or acc["owner_tg_id"] != tg:
+                await message.reply("Нет такого аккаунта среди твоих.")
+                return
+            await message.reply("🔄 Перезапускаю вход в MAX…")
+            await self._restart_account(account_id, announce=True)
 
         @dp.message(Command("add"))
         async def cmd_add(message: TgMessage) -> None:
