@@ -546,52 +546,26 @@ class Account:
             return
         tg_chat, tg_msg, role, body = target
 
-        # Разбираем реакции: чипсы для подписи и доминирующая для нативной.
-        chips = []
+        # Доминирующая реакция (с наибольшим счётчиком).
         dominant = ""
         best = -1
         for c in counters or []:
             emoji = (self._counter_field(c, "reaction") or "").strip()
             cnt = self._counter_field(c, "count") or 0
-            if not emoji:
-                continue
-            chips.append(f"{emoji}{cnt}" if cnt > 1 else emoji)
-            if cnt > best:
+            if emoji and cnt > best:
                 best, dominant = cnt, emoji
-        footer = " ".join(chips)
+        reactions = [ReactionTypeEmoji(emoji=dominant)] if dominant else []
         logger.info(
-            "[%s] реакции msg=%s role=%s -> %r", self.name, max_msg_id, role, footer
+            "[%s] реакция msg=%s role=%s emoji=%r",
+            self.name, max_msg_id, role, dominant,
         )
-
-        if role == "user":
-            # Сообщение пользователя — ставим видимую реакцию (или снимаем).
-            reactions = [ReactionTypeEmoji(emoji=dominant)] if dominant else []
-            try:
-                await self.bot.set_message_reaction(tg_chat, tg_msg, reactions)
-            except Exception as e:
-                if not reactions and "EMPTY" in str(e).upper():
-                    logger.debug("нечего снимать")
-                else:
-                    logger.info("[%s] реакцию не поставить: %s", self.name, e)
-            return
-
-        # Входящее (сообщение бота) — дописываем реакции подписью.
-        new_text = (body or "") + (f"\n{footer}" if footer else "")
         try:
-            if role == "caption":
-                await self.bot.edit_message_caption(
-                    chat_id=tg_chat, message_id=tg_msg,
-                    caption=new_text or None,
-                )
+            await self.bot.set_message_reaction(tg_chat, tg_msg, reactions)
+        except Exception as e:
+            if not reactions and "EMPTY" in str(e).upper():
+                logger.debug("нечего снимать")
             else:
-                await self.bot.edit_message_text(
-                    new_text or "📭", chat_id=tg_chat, message_id=tg_msg,
-                )
-        except TelegramBadRequest as e:
-            if "not modified" not in str(e).lower():
-                logger.info("[%s] правка реакций не прошла: %s", self.name, e)
-        except Exception:
-            logger.debug("правка реакций не прошла", exc_info=True)
+                logger.info("[%s] реакцию не поставить: %s", self.name, e)
 
     async def _handle_raw_reaction(self, payload: dict) -> None:
         """Разбирает фрейм реакции (опкод 156): messageId + reactionInfo."""
