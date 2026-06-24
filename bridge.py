@@ -263,6 +263,7 @@ class Account:
         self._sent_since_trim = 0
         self._reaction_diag_done = False
         self._seen_opcodes: set[int] = set()
+        self._last_chat_reaction: tuple | None = None
         self._register_max_handler()
 
     # ── имена ─────────────────────────────────────────────────────────────
@@ -437,6 +438,8 @@ class Account:
                     )
                 if op in (155, 156):
                     await self._handle_raw_reaction(payload)
+                elif op == 135:
+                    await self._handle_chat_reaction(payload)
             except Exception:
                 logger.debug("[%s] raw-обработка не удалась",
                              self.name, exc_info=True)
@@ -568,7 +571,10 @@ class Account:
                 logger.info("[%s] реакцию не поставить: %s", self.name, e)
 
     async def _handle_raw_reaction(self, payload: dict) -> None:
-        """Разбирает фрейм реакции (опкод 156): messageId + reactionInfo."""
+        """Разбирает фрейм реакции (опкод 156): messageId + reactionInfo.
+
+        Приходит тому, кто ПОСТАВИЛ реакцию.
+        """
         if not isinstance(payload, dict):
             return
         message_id = payload.get("messageId")
@@ -578,6 +584,26 @@ class Account:
         counters = ri.get("counters") or []
         total = ri.get("totalCount") or 0
         await self._apply_reaction(message_id, counters, total)
+
+    async def _handle_chat_reaction(self, payload: dict) -> None:
+        """Обновление чата (опкод 135) приходит тому, чьё сообщение отреагировали.
+
+        Несёт lastReactedMessageId + lastReaction (последняя реакция в чате).
+        """
+        chat = payload.get("chat") if isinstance(payload, dict) else None
+        if not isinstance(chat, dict):
+            return
+        mid = chat.get("lastReactedMessageId")
+        reaction = (chat.get("lastReaction") or "").strip()
+        if mid is None:
+            return
+        # Опкод 135 приходит и не на реакции — дедуп по (msg, эмодзи).
+        key = (mid, reaction)
+        if key == self._last_chat_reaction:
+            return
+        self._last_chat_reaction = key
+        counters = [{"reaction": reaction, "count": 1}] if reaction else []
+        await self._apply_reaction(mid, counters, 1 if reaction else 0)
 
     async def _forward_to_telegram(self, message: Message) -> None:
         if message.sender is not None and message.sender == self._my_id():
