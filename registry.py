@@ -39,8 +39,40 @@ class Registry:
             )
             """
         )
+        await self._db.execute(
+            "CREATE TABLE IF NOT EXISTS bans ("
+            "tg_id INTEGER PRIMARY KEY, created_at INTEGER NOT NULL)"
+        )
         await self._db.commit()
         return self
+
+    # ── баны ─────────────────────────────────────────────────────────────
+
+    async def ban(self, tg_id: int) -> None:
+        assert self._db is not None
+        await self._db.execute(
+            "INSERT OR IGNORE INTO bans (tg_id, created_at) VALUES (?, ?)",
+            (tg_id, int(time.time())),
+        )
+        await self._db.commit()
+
+    async def unban(self, tg_id: int) -> None:
+        assert self._db is not None
+        await self._db.execute("DELETE FROM bans WHERE tg_id = ?", (tg_id,))
+        await self._db.commit()
+
+    async def is_banned(self, tg_id: int) -> bool:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT 1 FROM bans WHERE tg_id = ?", (tg_id,)
+        ) as cur:
+            return await cur.fetchone() is not None
+
+    async def list_bans(self) -> list[int]:
+        assert self._db is not None
+        async with self._db.execute("SELECT tg_id FROM bans") as cur:
+            rows = await cur.fetchall()
+        return [int(r[0]) for r in rows]
 
     async def add(
         self,

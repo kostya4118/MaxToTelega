@@ -1061,6 +1061,9 @@ class Manager:
                 await message.reply("Добавляй аккаунт в личке со мной.")
                 return
             tg = message.from_user.id
+            if await self.registry.is_banned(tg):
+                await message.answer("🚫 Доступ к боту ограничен.")
+                return
             reason = await self._check_add_quota(tg)
             if reason:
                 await message.answer(reason)
@@ -1183,6 +1186,80 @@ class Manager:
         async def cmd_muted(message: TgMessage) -> None:
             await self._route_command(message, "muted")
 
+        @dp.message(Command("admin"))
+        async def cmd_admin(message: TgMessage, command: CommandObject) -> None:
+            if message.from_user.id not in self.admin_ids:
+                return  # тихо игнорируем для не-админов
+            args = (command.args or "").split()
+            if not args:
+                await self._admin_dashboard(message)
+                return
+            sub = args[0].lower()
+            if sub == "list":
+                await self._admin_list(message)
+            elif sub == "user" and len(args) > 1 and args[1].lstrip("-").isdigit():
+                await self._admin_list(message, owner=int(args[1]))
+            elif sub in ("stop", "start", "remove") and len(args) > 1 \
+                    and args[1].isdigit():
+                await self._admin_action(message, sub, int(args[1]))
+            else:
+                await message.reply(
+                    "Подкоманды: /admin list | user <tg_id> | "
+                    "stop N | start N | remove N"
+                )
+
+        @dp.message(Command("ban"))
+        async def cmd_ban(message: TgMessage, command: CommandObject) -> None:
+            if message.from_user.id not in self.admin_ids:
+                return
+            arg = (command.args or "").strip()
+            if not arg.lstrip("-").isdigit():
+                await message.reply("Использование: /ban <tg_id>")
+                return
+            target = int(arg)
+            if target in self.admin_ids:
+                await message.reply("Админа банить нельзя.")
+                return
+            await self.registry.ban(target)
+            stopped = 0
+            for a in await self.registry.list_by_owner(target):
+                await self._cleanup_account(a["id"], delete=False)
+                await self.registry.set_status(a["id"], "banned")
+                stopped += 1
+            await message.reply(
+                f"🚫 Пользователь {target} забанен. Остановлено аккаунтов: "
+                f"{stopped}. Разбан: /unban {target}"
+            )
+            try:
+                await self.bot.send_message(
+                    target, "🚫 Доступ к боту ограничен администратором."
+                )
+            except Exception:
+                pass
+
+        @dp.message(Command("unban"))
+        async def cmd_unban(message: TgMessage, command: CommandObject) -> None:
+            if message.from_user.id not in self.admin_ids:
+                return
+            arg = (command.args or "").strip()
+            if not arg.lstrip("-").isdigit():
+                await message.reply("Использование: /unban <tg_id>")
+                return
+            await self.registry.unban(int(arg))
+            await message.reply(f"✅ Пользователь {arg} разбанен.")
+
+        @dp.message(Command("banned"))
+        async def cmd_banned(message: TgMessage) -> None:
+            if message.from_user.id not in self.admin_ids:
+                return
+            ids = await self.registry.list_bans()
+            if not ids:
+                await message.reply("Забаненных нет.")
+                return
+            await message.reply(
+                "🚫 Забанены:\n" + "\n".join(str(i) for i in ids)
+            )
+
         @dp.callback_query()
         async def on_callback(cb: CallbackQuery) -> None:
             data = cb.data or ""
@@ -1234,6 +1311,69 @@ class Manager:
             await worker.toggle_mute(message, muted=False)
         elif cmd == "muted":
             await worker.list_muted(message)
+
+    # ── админ-панель ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _mask_phone(phone: str) -> str:
+        return f"…{phone[-4:]}" if phone and len(phone) > 4 else (phone or "?")
+
+    async def _admin_dashboard(self, message: TgMessage) -> None:
+        accs = await self.registry.list_all()
+        bans = await self.registry.list_bans()
+        users = len({a["owner_tg_id"] for a in accs})
+        online = sum(1 for a in accs if a["id"] in self.workers)
+        status: dict[str, int] = {}
+        for a in accs:
+            status[a["status"]] = status.get(a["status"], 0) + 1
+        st = ", ".join(f"{k}: {v}" for k, v in sorted(status.items())) or "—"
+        await message.answer(
+            "👑 *Админ-панель*\n"
+            f"Пользователей: {users}\n"
+            f"Аккаунтов: {len(accs)} (🟢 онлайн {online})\n"
+            f"Статусы: {st}\n"
+            f"Забанено: {len(bans)}\n\n"
+            "Подробно: /admin list | /admin user <tg_id>\n"
+            "Управление: /admin stop N | start N | remove N\n"
+            "Доступ: /ban <tg_id> | /unban <tg_id> | /banned",
+            parse_mode="Markdown",
+        )
+
+    async def _admin_list(self, message: TgMessage, owner: int | None = None) -> None:
+        accs = await self.registry.list_all()
+        if owner is not None:
+            accs = [a for a in accs if a["owner_tg_id"] == owner]
+        if not accs:
+            await message.answer("Аккаунтов нет.")
+            return
+        lines = []
+        for a in accs[:60]:
+            dot = "🟢" if a["id"] in self.workers else "⚪️"
+            grp = "✅" if a["group_id"] else "⚠️"
+            lines.append(
+                f"{dot} #{a['id']} «{a['name']}» {self._mask_phone(a['phone'])} "
+                f"— owner {a['owner_tg_id']} — {grp} — {a['status']}"
+            )
+        extra = f"\n… и ещё {len(accs) - 60}" if len(accs) > 60 else ""
+        await message.answer("\n".join(lines) + extra)
+
+    async def _admin_action(
+        self, message: TgMessage, action: str, account_id: int
+    ) -> None:
+        acc = await self.registry.get(account_id)
+        if acc is None:
+            await message.reply(f"Аккаунта #{account_id} нет.")
+            return
+        if action == "stop":
+            await self._cleanup_account(account_id, delete=False)
+            await self.registry.set_status(account_id, "stopped")
+            await message.reply(f"⏹ Аккаунт #{account_id} остановлен.")
+        elif action == "start":
+            await self._restart_account(account_id, announce=True)
+            await message.reply(f"▶️ Аккаунт #{account_id} запускается…")
+        elif action == "remove":
+            await self._cleanup_account(account_id, delete=True)
+            await message.reply(f"🗑 Аккаунт #{account_id} удалён.")
 
     async def _on_phone(self, message: TgMessage) -> None:
         tg = message.from_user.id
