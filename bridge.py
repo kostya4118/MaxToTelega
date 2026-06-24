@@ -150,6 +150,7 @@ class Account:
         self._chat_cache: dict[int, object] = {}
         self._topic_lock = asyncio.Lock()
         self._warned_no_group = False
+        self._diag_empty: set[int] = set()
         self._register_max_handler()
 
     # ── имена ─────────────────────────────────────────────────────────────
@@ -413,6 +414,20 @@ class Account:
             caption_used = True
 
         if not sent_ids:
+            # Диагностика: сообщение вышло пустым — покажем, какие «лишние»
+            # поля прислал MAX (там, вероятно, лежит пересланное/ответ).
+            if message.chat_id not in self._diag_empty:
+                self._diag_empty.add(message.chat_id)
+                try:
+                    extra = getattr(message, "model_extra", None) or {}
+                    logger.info(
+                        "[%s] DIAG пустое сообщение chat=%s type=%s "
+                        "extra_keys=%s link=%r",
+                        self.name, message.chat_id, message.type,
+                        list(extra.keys()), str(extra.get("link"))[:1500],
+                    )
+                except Exception:
+                    logger.debug("diag dump failed", exc_info=True)
             sent = await self.bot.send_message(
                 dest, body or "📭 (пустое сообщение)",
                 message_thread_id=thread, disable_notification=silent,
