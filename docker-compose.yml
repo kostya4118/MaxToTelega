@@ -5,12 +5,9 @@ services:
     container_name: maxtotelega
     env_file: .env
     environment:
-      # Внутри контейнера данные всегда в /app/data.
+      # Внутри контейнера данные (реестр, сессии, бэкапы) всегда в /app/data.
       WORK_DIR: /app/data
-      MAPPING_DB: /app/data/mapping.db
     volumes:
       - ./data:/app/data
     restart: unless-stopped
-    # Нужно для интерактивного ввода SMS-кода на первом запуске.
-    stdin_open: true
-    tty: true
+    # Вход в MAX идёт через Telegram-чат — интерактивная консоль не нужна.

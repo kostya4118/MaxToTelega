@@ -8,7 +8,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY *.py ./
 
-# Сессия MAX и база маршрутизации живут здесь (примонтируй томом).
+# Реестр, сессии MAX, маршрутизация и бэкапы живут здесь (примонтируй томом).
 VOLUME ["/app/data"]
 
 CMD ["python", "-u", "bridge.py"]

@@ -29,6 +29,7 @@ from datetime import datetime
 
 import aiohttp
 from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     BufferedInputFile,
@@ -129,6 +130,21 @@ TG_CAPTION_LIMIT = 1024
 PHONE_RE = re.compile(r"^\+\d{7,15}$")
 AUTH_TIMEOUT = 300  # сек на ввод кода/пароля
 TG_UPLOAD_LIMIT = 45 * 1024 * 1024  # запас под лимит бота Telegram (~50 МБ)
+
+
+async def _retry_after_middleware(make_request, bot, method):
+    """Session-middleware: при flood-control (429) ждём и переотправляем."""
+    for _ in range(5):
+        try:
+            return await make_request(bot, method)
+        except TelegramRetryAfter as e:
+            wait = e.retry_after + 1
+            logger.warning(
+                "Telegram flood-control (%s): пауза %s сек",
+                type(method).__name__, wait,
+            )
+            await asyncio.sleep(wait)
+    return await make_request(bot, method)
 
 
 def _sqlite_snapshot(src: str, dst: str) -> None:
@@ -378,6 +394,14 @@ class Account:
             except Exception:
                 logger.exception("[%s] Ошибка зеркалирования удаления", self.name)
 
+        @self.client.on_reaction_update()
+        async def on_max_reaction(event, client: Client) -> None:
+            try:
+                await self._mirror_reaction(event)
+            except Exception:
+                logger.debug("[%s] Ошибка зеркалирования реакции",
+                             self.name, exc_info=True)
+
     async def _mirror_edit(self, message: Message) -> None:
         """Применяет правку сообщения MAX к его копии в Telegram."""
         if self.group_id is None or message.chat_id is None:
@@ -435,6 +459,35 @@ class Account:
                 except Exception:
                     logger.debug("delete_message не удался", exc_info=True)
             await self.storage.forget_msg(max_msg_id)
+
+    async def _mirror_reaction(self, event) -> None:
+        """Ставит доминирующую реакцию MAX на копию сообщения в Telegram."""
+        if self.group_id is None:
+            return
+        try:
+            max_msg_id = int(event.message_id)
+        except (TypeError, ValueError):
+            return
+        rows = await self.storage.get_msg_map(max_msg_id)
+        if not rows:
+            return
+        # Носитель: текст/подпись, иначе первое.
+        target = next(
+            ((c, m) for c, m, role in rows if role in ("text", "caption")),
+            (rows[0][0], rows[0][1]),
+        )
+        reactions: list[ReactionTypeEmoji] = []
+        counters = getattr(event, "counters", None) or []
+        if counters and getattr(event, "total_count", 0):
+            top = max(counters, key=lambda c: getattr(c, "count", 0))
+            emoji = (getattr(top, "reaction", "") or "").strip()
+            if emoji:
+                reactions = [ReactionTypeEmoji(emoji=emoji)]
+        try:
+            # Если emoji не из разрешённого Telegram набора — просто пропустим.
+            await self.bot.set_message_reaction(target[0], target[1], reactions)
+        except Exception:
+            logger.debug("Реакцию не отзеркалить", exc_info=True)
 
     async def _forward_to_telegram(self, message: Message) -> None:
         if message.sender is not None and message.sender == self._my_id():
@@ -885,6 +938,8 @@ class Manager:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.bot = Bot(config.telegram_token)
+        # Авто-ретрай при flood-control Telegram (429).
+        self.bot.session.middleware(_retry_after_middleware)
         self.dp = Dispatcher()
         self.http: aiohttp.ClientSession | None = None
         self.registry: Registry | None = None
