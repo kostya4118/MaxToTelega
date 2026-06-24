@@ -246,6 +246,7 @@ class Account:
         self._diag_empty: set[int] = set()
         self._sent_since_trim = 0
         self._reaction_diag_done = False
+        self._seen_opcodes: set[int] = set()
         self._register_max_handler()
 
     # ── имена ─────────────────────────────────────────────────────────────
@@ -407,16 +408,21 @@ class Account:
                              self.name, exc_info=True)
 
         async def on_max_raw(frame, client: Client) -> None:
-            # Реакции на версиях PyMax без on_reaction_update: ловим сырой
-            # фрейм опкода 155 (NOTIF_MSG_REACTIONS_CHANGED).
             try:
-                if getattr(frame, "opcode", None) != 155:
-                    return
-                await self._handle_raw_reaction(
-                    getattr(frame, "payload", None) or {}
-                )
+                op = getattr(frame, "opcode", None)
+                payload = getattr(frame, "payload", None) or {}
+                # Диагностика: каждый новый опкод логируем один раз — чтобы
+                # увидеть, каким фреймом приходит реакция.
+                if op not in self._seen_opcodes:
+                    self._seen_opcodes.add(op)
+                    keys = list(payload.keys()) if isinstance(payload, dict) else "?"
+                    logger.info(
+                        "[%s] raw opcode=%s keys=%s", self.name, op, keys
+                    )
+                if op == 155:
+                    await self._handle_raw_reaction(payload)
             except Exception:
-                logger.debug("[%s] raw-реакция не разобрана",
+                logger.debug("[%s] raw-обработка не удалась",
                              self.name, exc_info=True)
 
         self._register_optional("on_message_edit", on_max_edit)
@@ -430,13 +436,15 @@ class Account:
         """Регистрирует обработчик, если такой хук есть в этой версии PyMax."""
         factory = getattr(self.client, hook, None)
         if not callable(factory):
-            logger.debug("[%s] PyMax без %s — пропускаю", self.name, hook)
+            logger.info("[%s] хук %s недоступен в этой версии PyMax",
+                        self.name, hook)
             return
         try:
             factory()(handler)
+            logger.info("[%s] хук %s подключён", self.name, hook)
         except Exception:
-            logger.debug("[%s] Не удалось зарегистрировать %s",
-                         self.name, hook, exc_info=True)
+            logger.info("[%s] не удалось подключить %s",
+                        self.name, hook, exc_info=True)
 
     async def _mirror_edit(self, message: Message) -> None:
         """Применяет правку сообщения MAX к его копии в Telegram."""
