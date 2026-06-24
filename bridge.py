@@ -853,9 +853,15 @@ class Account:
                         message_thread_id=thread, disable_notification=silent,
                     )
                 elif kind == "poll":
+                    opts = data["options"]
+                    try:
+                        from aiogram.types import InputPollOption
+                        opts = [InputPollOption(text=o) for o in opts]
+                    except Exception:
+                        pass
                     sent = await self.bot.send_poll(
                         dest, question=data["question"],
-                        options=data["options"], is_anonymous=True,
+                        options=opts, is_anonymous=True,
                         message_thread_id=thread, disable_notification=silent,
                     )
                 else:
@@ -974,7 +980,33 @@ class Account:
                     type_name = (
                         t.value if hasattr(t, "value") else str(t or "вложение")
                     )
-                    notes.append(f"📎 {type_name}")
+                    extra = getattr(attach, "model_extra", None) or {}
+                    if type_name == "POLL":
+                        title = str(extra.get("title") or "Опрос")[:300]
+                        answers = extra.get("answers") or []
+                        options = [
+                            str(a.get("text") or "")[:100]
+                            for a in answers
+                            if isinstance(a, dict) and a.get("text")
+                        ][:10]
+                        if len(options) >= 2:
+                            specials.append(("poll", {
+                                "question": title, "options": options,
+                            }))
+                        else:
+                            notes.append(f"📊 Опрос: {title}")
+                    elif type_name in ("LOCATION", "GEO", "GEOLOCATION"):
+                        lat = extra.get("latitude", extra.get("lat"))
+                        lon = extra.get("longitude",
+                                        extra.get("lon", extra.get("lng")))
+                        if lat is not None and lon is not None:
+                            specials.append(("location", {
+                                "lat": lat, "lon": lon,
+                            }))
+                        else:
+                            notes.append("📍 геолокация")
+                    else:
+                        notes.append(f"📎 {type_name}")
                     self._diag_attach(attach)
             except Exception:
                 logger.exception("Не удалось обработать вложение из MAX")
