@@ -38,20 +38,128 @@
 - Python **3.10+**
 - Telegram-бот (токен от [@BotFather](https://t.me/BotFather))
 
-## Установка
+## Установка и настройка с нуля
+
+Пошагово — для оператора, который поднимает бота на своём Linux-сервере.
+
+### Шаг 1. Создай Telegram-бота
+
+1. Открой [@BotFather](https://t.me/BotFather) → `/newbot` → задай имя и
+   username (`..._bot`). BotFather пришлёт **токен** вида `123456:ABC-DEF…` —
+   сохрани его.
+2. Там же настрой бота (по желанию, но удобно):
+   - `/setprivacy` → выбери бота → **Disable** (чтобы видел команды в группах).
+   - `/setcommands` → выбери бота → вставь:
+     ```
+     add - добавить MAX-аккаунт
+     accounts - мои аккаунты
+     remove - удалить аккаунт
+     setproxy - задать прокси аккаунту
+     relogin - повторить вход
+     bind - привязать группу (в группе)
+     mute - заглушить тему
+     unmute - вернуть звук
+     muted - список заглушённых
+     help - помощь
+     ```
+
+### Шаг 2. Узнай свой Telegram id (ты будешь админом)
+
+Напиши [@userinfobot](https://t.me/userinfobot) — он пришлёт твой числовой id.
+Он нужен для `ADMIN_TG_ID`: только админ одобряет чужие регистрации (и сам
+добавляет аккаунты без подтверждения).
+
+### Шаг 3. Подготовь сервер
+
+Команды для Debian/Ubuntu. Проверь Python (нужен **3.10+**): `python3 --version`.
 
 ```bash
-git clone https://github.com/kostya4118/MaxToTelega.git
-cd MaxToTelega
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env       # впиши TELEGRAM_BOT_TOKEN
-python bridge.py
+# отдельный системный пользователь без логина — мост живёт под ним
+sudo useradd --system --create-home --home-dir /opt/maxtotelega \
+     --shell /usr/sbin/nologin maxbridge
+
+# код и виртуальное окружение (НИКОГДА не ставь зависимости в системный python)
+sudo -u maxbridge git clone https://github.com/kostya4118/MaxToTelega.git \
+     /opt/maxtotelega/app
+cd /opt/maxtotelega/app
+sudo -u maxbridge python3 -m venv .venv
+sudo -u maxbridge ./.venv/bin/pip install --upgrade pip
+sudo -u maxbridge ./.venv/bin/pip install -r requirements.txt
 ```
 
-Для бота у @BotFather желательно **включить inline/группы** и затем сделать бота
-админом нужных групп (см. ниже). Команды можно добавить через BotFather для
-удобства: `add, accounts, remove, bind, mute, unmute, muted`.
+### Шаг 4. Заполни `.env`
+
+```bash
+sudo -u maxbridge cp .env.example .env
+sudo -u maxbridge nano .env
+```
+
+Минимум, что нужно вписать:
+
+```ini
+TELEGRAM_BOT_TOKEN=123456:ABC-DEF...   # из шага 1
+ADMIN_TG_ID=123456789                  # твой id из шага 2
+```
+
+Закрой файл от посторонних (в нём токен):
+
+```bash
+sudo chmod 600 /opt/maxtotelega/app/.env
+sudo chown maxbridge:maxbridge /opt/maxtotelega/app/.env
+```
+
+### Шаг 5. Запусти как сервис (systemd)
+
+Вход в MAX теперь идёт через Telegram, поэтому интерактивный запуск в консоли
+не нужен — сразу делаем сервис.
+
+```bash
+sudo tee /etc/systemd/system/maxtotelega.service > /dev/null <<'EOF'
+[Unit]
+Description=MaxToTelega bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=maxbridge
+Group=maxbridge
+WorkingDirectory=/opt/maxtotelega/app
+ExecStart=/opt/maxtotelega/app/.venv/bin/python -u bridge.py
+Restart=always
+RestartSec=10
+MemoryMax=400M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/maxtotelega/app/data
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now maxtotelega
+sudo journalctl -u maxtotelega -f
+```
+
+В логах хочешь увидеть `Запуск мультитенантного моста…` и
+`Run polling for bot @твойбот`. Бот готов принимать `/add`.
+
+### Шаг 6. Проверь, что бот живой
+
+Напиши боту в личке `/start` — он ответит списком команд. Дальше — добавляй
+аккаунты (раздел «Как пользоваться» ниже).
+
+### Обновление в будущем
+
+```bash
+cd /opt/maxtotelega/app
+sudo -u maxbridge git pull
+sudo systemctl restart maxtotelega
+```
+Зависимости меняются редко; если в коммите тронут `requirements.txt` —
+`sudo -u maxbridge ./.venv/bin/pip install -r requirements.txt` перед рестартом.
 
 ## Как пользоваться (для каждого пользователя)
 
@@ -73,6 +181,8 @@ python bridge.py
 | `/add` | личка | добавить MAX-аккаунт (телефон + SMS + 2FA) |
 | `/accounts` | личка | список твоих аккаунтов и статус |
 | `/remove N` | личка | удалить аккаунт N (сессию и темы) |
+| `/setproxy N <url>` | личка | задать прокси аккаунту (`off` — убрать) |
+| `/relogin N` | личка | повторить вход (после прокси / сброса сессии) |
 | `/bind [N]` | группа | привязать группу к аккаунту |
 | `/mute` / `/unmute` | тема | заглушить/вернуть звук этого чата |
 | `/muted` | группа | список заглушённых чатов |
