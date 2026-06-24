@@ -958,7 +958,12 @@ class Account:
                         if u and u.phone:
                             phone = u.phone
                     except Exception:
-                        pass
+                        logger.debug("get_user для контакта не удался",
+                                     exc_info=True)
+                    logger.info(
+                        "[%s] контакт %s phone_found=%s",
+                        self.name, attach.contact_id, bool(phone),
+                    )
                     if phone:
                         specials.append(("contact", {
                             "phone": f"+{phone}",
