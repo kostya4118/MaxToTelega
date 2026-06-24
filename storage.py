@@ -108,6 +108,14 @@ class Storage:
             row = await cursor.fetchone()
         return row[0] if row and row[0] is not None else None
 
+    async def clear_topic(self, max_chat_id: int) -> None:
+        """Удаляет привязку темы (например, тему удалили в Telegram)."""
+        assert self._db is not None
+        await self._db.execute(
+            "DELETE FROM topics WHERE max_chat_id = ?", (max_chat_id,)
+        )
+        await self._db.commit()
+
     async def set_topic_title(self, max_chat_id: int, title: str) -> None:
         assert self._db is not None
         await self._db.execute(

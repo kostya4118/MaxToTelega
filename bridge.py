@@ -29,7 +29,7 @@ from datetime import datetime
 
 import aiohttp
 from aiogram import Bot, Dispatcher
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     BufferedInputFile,
@@ -534,6 +534,25 @@ class Account:
             return
         await self._maybe_rename_topic(message.chat_id, thread)
 
+        try:
+            await self._deliver(message, chat, is_group, dest, thread)
+        except TelegramBadRequest as e:
+            if "thread not found" not in str(e).lower():
+                raise
+            # Тему удалили в Telegram — пересоздаём и повторяем один раз.
+            logger.info(
+                "[%s] Тема чата %s пропала — пересоздаю",
+                self.name, message.chat_id,
+            )
+            await self.storage.clear_topic(message.chat_id)
+            thread = await self._ensure_thread(message.chat_id, chat)
+            if thread is None:
+                return
+            await self._deliver(message, chat, is_group, dest, thread)
+
+    async def _deliver(
+        self, message: Message, chat, is_group: bool, dest: int, thread: int
+    ) -> None:
         silent = await self.storage.is_muted(message.chat_id)
 
         parts: list[str] = []
