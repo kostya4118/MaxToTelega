@@ -607,6 +607,25 @@ class Account:
                     pass
             return
 
+        # Реакции в этой версии MAX приходят как «пустое» сообщение с
+        # обновлённым reaction_info. Не постим пустышку — зеркалим реакцию.
+        extra = getattr(message, "model_extra", None) or {}
+        has_content = bool(message.text) or bool(message.attaches) or isinstance(
+            extra.get("link"), dict
+        )
+        ri = getattr(message, "reaction_info", None)
+        if ri is not None and not has_content:
+            counters = getattr(ri, "counters", None) or []
+            total = getattr(ri, "total_count", 0) or 0
+            logger.info(
+                "[%s] reaction-update msg=%s total=%s counters=%s",
+                self.name, message.id, total,
+                [(self._counter_field(c, "reaction"),
+                  self._counter_field(c, "count")) for c in counters],
+            )
+            await self._apply_reaction(message.id, counters, total)
+            return
+
         dest = self.group_id
         chat = await self._get_chat(message.chat_id)
         is_group = chat is not None and chat.type != ChatType.DIALOG
@@ -757,9 +776,11 @@ class Account:
                     extra = getattr(message, "model_extra", None) or {}
                     logger.info(
                         "[%s] DIAG пустое сообщение chat=%s type=%s "
-                        "extra_keys=%s link=%r",
+                        "extra_keys=%s reaction_info=%r link=%r",
                         self.name, message.chat_id, message.type,
-                        list(extra.keys()), str(extra.get("link"))[:1500],
+                        list(extra.keys()),
+                        getattr(message, "reaction_info", None),
+                        str(extra.get("link"))[:800],
                     )
                 except Exception:
                     logger.debug("diag dump failed", exc_info=True)
