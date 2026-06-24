@@ -331,6 +331,13 @@ class Account:
         media, notes = await self._collect_incoming_media(message)
         if not message.text and notes:
             parts.extend(notes)
+
+        # Пересланное / ответ: контент лежит во вложенном message (extra "link").
+        fwd_media, fwd_parts = await self._collect_forward(message)
+        if fwd_media or fwd_parts:
+            parts.extend(fwd_parts)
+            media = fwd_media + media
+
         body = "\n".join(parts)
         sent_ids: list[int] = []
 
@@ -495,6 +502,70 @@ class Account:
             except Exception:
                 logger.exception("Не удалось обработать вложение из MAX")
                 notes.append("📎 вложение (ошибка обработки)")
+        return result, notes
+
+    async def _collect_forward(
+        self, message: Message
+    ) -> tuple[list[tuple[str, str, bytes]], list[str]]:
+        """Разбирает пересланное/ответ из extra-поля 'link' (вложенный message)."""
+        extra = getattr(message, "model_extra", None) or {}
+        link = extra.get("link")
+        if not isinstance(link, dict):
+            return [], []
+        nested = link.get("message")
+        if not isinstance(nested, dict):
+            return [], []
+
+        ltype = str(link.get("type") or "").upper()
+        orig = nested.get("sender")
+        who = await self._user_name(orig) if isinstance(orig, int) else None
+        parts: list[str] = []
+        if ltype == "REPLY":
+            parts.append("↩️ В ответ" + (f" {who}" if who else ""))
+        else:
+            parts.append("↪️ Переслано" + (f" от {who}" if who else ""))
+        ntext = str(nested.get("text") or "").strip()
+        if ntext:
+            parts.append(ntext)
+
+        media, notes = await self._collect_nested_media(nested)
+        parts.extend(notes)
+        return media, parts
+
+    async def _collect_nested_media(
+        self, nested: dict
+    ) -> tuple[list[tuple[str, str, bytes]], list[str]]:
+        """Вложения вложенного (пересланного) сообщения — только по прямым URL."""
+        result: list[tuple[str, str, bytes]] = []
+        notes: list[str] = []
+        for a in nested.get("attaches", []) or []:
+            if not isinstance(a, dict):
+                continue
+            t = str(a.get("_type") or "").upper()
+            try:
+                if t == "PHOTO" and a.get("baseUrl"):
+                    data = await self._download(a["baseUrl"])
+                    if data:
+                        result.append(("photo", "photo.jpg", data))
+                elif t == "STICKER" and a.get("url"):
+                    data = await self._download(a["url"])
+                    if data:
+                        result.append(("sticker", "sticker.webp", data))
+                elif t == "AUDIO" and a.get("url"):
+                    data = await self._download(a["url"])
+                    if data:
+                        result.append(("audio", "audio.mp3", data))
+                elif t == "VIDEO":
+                    notes.append("🎬 видео")
+                elif t == "FILE":
+                    notes.append(f"📎 файл: {a.get('name') or 'без имени'}")
+                elif t == "SHARE":
+                    notes.append("🔗 ссылка / репост")
+                elif t:
+                    notes.append(f"📎 {t.lower()}")
+            except Exception:
+                logger.exception("Вложение пересланного не обработано")
+                notes.append("📎 вложение")
         return result, notes
 
     async def _download(self, url: str) -> bytes | None:
