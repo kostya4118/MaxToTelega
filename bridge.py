@@ -42,6 +42,7 @@ from aiogram.types import (
     ReactionTypeEmoji,
 )
 from aiogram.types import Message as TgMessage
+from aiogram.types import MessageReactionUpdated
 
 from pymax import (
     ApiError,
@@ -428,9 +429,9 @@ class Account:
             try:
                 op = getattr(frame, "opcode", None)
                 payload = getattr(frame, "payload", None) or {}
-                # Диагностика: каждый новый опкод логируем один раз — чтобы
-                # увидеть, каким фреймом приходит реакция.
-                if op not in self._seen_opcodes:
+                # Диагностика: реакционные опкоды (135/156) логируем всегда,
+                # остальные — один раз на тип.
+                if op in (135, 156) or op not in self._seen_opcodes:
                     self._seen_opcodes.add(op)
                     logger.info(
                         "[%s] raw opcode=%s payload=%r",
@@ -998,6 +999,36 @@ class Account:
         except Exception:
             logger.exception("[%s] Ошибка отправки TG->MAX", self.name)
             await message.reply("⚠️ Не удалось отправить в MAX (см. логи).")
+
+    async def handle_tg_reaction(self, tg_message_id, new_reaction) -> None:
+        """Реакция владельца в Telegram → ставит/снимает её в MAX."""
+        if self.group_id is None or not self._max_online():
+            return
+        target = await self.storage.max_msg_by_tg(self.group_id, tg_message_id)
+        if target is None:
+            return
+        max_chat_id, max_message_id = target
+        emoji = None
+        for r in new_reaction or []:
+            e = getattr(r, "emoji", None)
+            if e:
+                emoji = e
+                break
+        try:
+            if emoji:
+                await self.client.add_reaction(
+                    max_chat_id, str(max_message_id), emoji
+                )
+            else:
+                await self.client.remove_reaction(
+                    max_chat_id, str(max_message_id)
+                )
+            logger.info(
+                "[%s] реакция TG->MAX msg=%s emoji=%r",
+                self.name, max_message_id, emoji,
+            )
+        except Exception as e:
+            logger.info("[%s] реакцию в MAX не поставить: %s", self.name, e)
 
     async def _target_for(self, message: TgMessage) -> tuple[int | None, int | None]:
         thread = message.message_thread_id
@@ -1652,6 +1683,21 @@ class Manager:
                     "в Telegram, скопируй с сервера вручную)."
                 )
 
+        @dp.message_reaction()
+        async def on_tg_reaction(event: MessageReactionUpdated) -> None:
+            acc = self.by_group.get(event.chat.id)
+            if acc is None:
+                return
+            user = event.user
+            if user is None or user.id != acc.owner_tg_id:
+                return
+            try:
+                await acc.handle_tg_reaction(
+                    event.message_id, event.new_reaction
+                )
+            except Exception:
+                logger.debug("Ошибка реакции TG->MAX", exc_info=True)
+
         @dp.callback_query()
         async def on_callback(cb: CallbackQuery) -> None:
             data = cb.data or ""
@@ -1938,7 +1984,12 @@ class Manager:
         backup_task = asyncio.create_task(self._backup_loop(), name="backup")
 
         try:
-            await self.dp.start_polling(self.bot)
+            # allowed_updates с message_reaction — иначе Telegram не шлёт
+            # события реакций (нужны для TG -> MAX).
+            await self.dp.start_polling(
+                self.bot,
+                allowed_updates=self.dp.resolve_used_update_types(),
+            )
         finally:
             backup_task.cancel()
             for task in list(self.tasks.values()):

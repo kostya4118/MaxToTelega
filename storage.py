@@ -266,6 +266,19 @@ class Storage:
             rows = await cur.fetchall()
         return [(int(r[0]), int(r[1]), str(r[2])) for r in rows]
 
+    async def max_msg_by_tg(
+        self, tg_chat_id: int, tg_message_id: int
+    ) -> tuple[int, int] | None:
+        """Обратный поиск: по Telegram-сообщению → (max_chat_id, max_message_id)."""
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT max_chat_id, max_message_id FROM msg_map "
+            "WHERE tg_chat_id = ? AND tg_message_id = ? LIMIT 1",
+            (tg_chat_id, tg_message_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return (int(row[0]), int(row[1])) if row else None
+
     async def forget_msg(self, max_message_id: int) -> None:
         assert self._db is not None
         await self._db.execute(
