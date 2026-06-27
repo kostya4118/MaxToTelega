@@ -312,6 +312,9 @@ class Account:
         self._seen_opcodes: set[int] = set()
         self._last_chat_reaction: tuple | None = None
         self._diag_attaches: set[str] = set()
+        # Темы, созданные только что: Telegram авто-закрепляет первое
+        # сообщение — снимем его после отправки.
+        self._fresh_topics: set[int] = set()
         self._register_max_handler()
 
     # ── имена ─────────────────────────────────────────────────────────────
@@ -413,6 +416,7 @@ class Account:
             await self.storage.set_topic(
                 max_chat_id, topic.message_thread_id, name
             )
+            self._fresh_topics.add(max_chat_id)
             logger.info(
                 "[%s] Создана тема '%s' (thread=%s) для чата MAX %s",
                 self.name, name, topic.message_thread_id, max_chat_id,
@@ -903,6 +907,14 @@ class Account:
         if self._sent_since_trim >= 500:
             self._sent_since_trim = 0
             await self.storage.trim_msg_map(20000)
+
+        # Telegram авто-закрепляет первое сообщение новой темы — снимаем.
+        if message.chat_id in self._fresh_topics:
+            self._fresh_topics.discard(message.chat_id)
+            try:
+                await self.bot.unpin_all_forum_topic_messages(dest, thread)
+            except Exception:
+                logger.debug("unpin темы не удался", exc_info=True)
 
     async def _collect_incoming_media(
         self, message: Message
