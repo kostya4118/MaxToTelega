@@ -1202,8 +1202,9 @@ class Account:
             return
 
         user_id: int = getattr(user, "id", None) or user.contact.id
-        # В MAX диалог с пользователем адресуется его user_id.
-        max_chat_id = user_id
+        # get_chat_id(my_id, their_id) вычисляет chat_id диалога (синхронный).
+        my_id = self._my_id()
+        max_chat_id = self.client.get_chat_id(my_id, user_id)
 
         # Уже есть тема — просто сообщаем.
         existing_thread = await self.storage.get_topic(max_chat_id)
