@@ -1157,12 +1157,149 @@ class Account:
 
     async def handle_tg(self, message: TgMessage) -> None:
         if message.message_thread_id is None:
-            return  # General/без темы
+            await self._handle_general(message)
+            return
         try:
             await self._send_to_max(message)
         except Exception:
             logger.exception("[%s] Ошибка отправки TG->MAX", self.name)
             await message.reply("⚠️ Не удалось отправить в MAX (см. логи).")
+
+    async def _handle_general(self, message: TgMessage) -> None:
+        """General-тема группы: инициация нового чата MAX.
+
+        Формат:
+          +79991234567          — найти по телефону, создать чат
+          +79991234567 Привет!  — то же + отправить первое сообщение
+          username              — найти по ссылке/нику MAX
+          username Привет!      — то же + первое сообщение
+        """
+        text = (message.text or "").strip()
+        if not text or text.startswith("/"):
+            return
+
+        parts = text.split(maxsplit=1)
+        query = parts[0].lstrip("@")
+        first_text = parts[1] if len(parts) > 1 else ""
+
+        hint = await message.reply("🔍 Ищу пользователя в MAX…")
+
+        try:
+            user = await self._find_max_user(query)
+        except Exception as e:
+            await hint.edit_text(f"⚠️ Ошибка поиска: {e}")
+            return
+
+        if user is None:
+            await hint.edit_text(
+                "❌ Пользователь не найден.\n\n"
+                "Напиши номер телефона (+79991234567) или username из MAX."
+            )
+            return
+
+        user_id: int = user.contact.id
+        # В MAX диалог с пользователем адресуется его user_id.
+        max_chat_id = user_id
+
+        # Уже есть тема — просто сообщаем.
+        existing_thread = await self.storage.get_topic(max_chat_id)
+        if existing_thread is not None:
+            name = self._label_for(user, user_id)
+            await hint.edit_text(
+                f"💬 Чат с «{name}» уже есть — тема #{existing_thread}."
+            )
+            return
+
+        # Отправляем первое сообщение в MAX (это создаёт диалог).
+        send_text = first_text or "👋"
+        try:
+            sent = await self.client.send_message(
+                chat_id=max_chat_id, text=send_text
+            )
+        except ApiError as e:
+            reason = (
+                getattr(e, "localized_message", None)
+                or getattr(e, "message", None) or str(e)
+            )
+            await hint.edit_text(f"⚠️ MAX не принял сообщение: {reason}")
+            return
+
+        # Создаём тему в Telegram.
+        thread = await self._ensure_thread(max_chat_id, None)
+        if thread is None:
+            await hint.edit_text("⚠️ Сообщение отправлено, но тему создать не удалось.")
+            return
+
+        # Запоминаем исходящее сообщение (для реакций собеседника).
+        if sent is not None and getattr(sent, "id", None) is not None:
+            await self.storage.remember_msg(
+                max_chat_id, sent.id,
+                self.group_id, 0,  # tg_message_id неизвестен — пишем 0
+                "user",
+            )
+
+        name = self._label_for(user, user_id)
+        await hint.edit_text(
+            f"✅ Чат с «{name}» создан! Пиши в новой теме.\n"
+            + (f'Первое сообщение отправлено: «{send_text}»' if first_text else "")
+        )
+        logger.info(
+            "[%s] Инициирован новый чат MAX %s -> тема %s",
+            self.name, max_chat_id, thread,
+        )
+
+    async def _find_max_user(self, query: str):
+        """Ищет пользователя MAX по телефону (+7…) или username/ссылке.
+
+        Возвращает объект user (с полем contact.id) или None.
+        """
+        # 1) Попытка по телефону через API.
+        if PHONE_RE.match(query) or (query.isdigit() and len(query) >= 7):
+            phone = query if query.startswith("+") else f"+{query}"
+            try:
+                user = await self.client.get_user_by_phone(phone)
+                if user is not None:
+                    return user
+            except AttributeError:
+                pass  # метода нет в этой версии PyMax
+            except Exception:
+                logger.debug("get_user_by_phone(%s) не удался", phone, exc_info=True)
+
+        # 2) Попытка через числовой ID (если query — число).
+        if query.lstrip("+").isdigit():
+            try:
+                uid = int(query.lstrip("+"))
+                user = await self.client.get_user(uid)
+                if user is not None:
+                    return user
+            except Exception:
+                logger.debug("get_user(%s) не удался", query, exc_info=True)
+
+        # 3) Поиск по username/ссылке среди известных чатов и контактов.
+        q = query.lower().lstrip("@")
+        for chat in self.client.chats or []:
+            for uid in chat.participants or {}:
+                if uid == self._my_id():
+                    continue
+                cached = self.client.get_cached_user(uid)
+                if cached is None:
+                    continue
+                link = (getattr(cached, "link", None) or "").lower().strip("/").split("/")[-1]
+                phone_raw = str(getattr(cached, "phone", "") or "")
+                if link == q or phone_raw == q.lstrip("+"):
+                    return cached
+
+        # 4) Попытка поиска через API (если метод есть).
+        try:
+            results = await self.client.search_users(query)
+            if results:
+                return results[0]
+        except AttributeError:
+            pass
+        except Exception:
+            logger.debug("search_users(%s) не удался", query, exc_info=True)
+
+        return None
 
     async def handle_tg_reaction(self, tg_message_id, new_reaction) -> None:
         """TG → MAX реакции ОТКЛЮЧЕНЫ.
