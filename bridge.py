@@ -1202,9 +1202,20 @@ class Account:
             return
 
         user_id: int = getattr(user, "id", None) or user.contact.id
-        # get_chat_id(my_id, their_id) вычисляет chat_id диалога (синхронный).
-        my_id = self._my_id()
-        max_chat_id = self.client.get_chat_id(my_id, user_id)
+        # get_chat_id — XOR двух ID; берём my_id из me.contact.id или me.id.
+        me = self.client.me
+        if me is None:
+            await hint.edit_text("⚠️ Аккаунт MAX ещё не готов. Попробуй через несколько секунд.")
+            return
+        my_id = (
+            me.contact.id
+            if getattr(me, "contact", None) is not None
+            else getattr(me, "id", None)
+        )
+        if my_id is None:
+            await hint.edit_text("⚠️ Не удалось определить ID аккаунта MAX.")
+            return
+        max_chat_id = my_id ^ user_id
 
         # Уже есть тема — просто сообщаем.
         existing_thread = await self.storage.get_topic(max_chat_id)
