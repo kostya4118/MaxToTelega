@@ -1201,7 +1201,7 @@ class Account:
             )
             return
 
-        user_id: int = user.contact.id
+        user_id: int = getattr(user, "id", None) or user.contact.id
         # В MAX диалог с пользователем адресуется его user_id.
         max_chat_id = user_id
 
