@@ -1217,14 +1217,24 @@ class Account:
             return
         max_chat_id = my_id ^ user_id
 
-        # Уже есть тема — просто сообщаем.
+        # Уже есть тема — проверяем, что она ещё существует в Telegram.
         existing_thread = await self.storage.get_topic(max_chat_id)
         if existing_thread is not None:
-            name = self._label_for(user, user_id)
-            await hint.edit_text(
-                f"💬 Чат с «{name}» уже есть — тема #{existing_thread}."
-            )
-            return
+            try:
+                await self.bot.send_chat_action(
+                    self.group_id, "typing", message_thread_id=existing_thread
+                )
+                name = self._label_for(user, user_id)
+                await hint.edit_text(
+                    f"💬 Чат с «{name}» уже есть — тема #{existing_thread}."
+                )
+                return
+            except TelegramBadRequest as e:
+                if "thread not found" in str(e).lower():
+                    await self.storage.clear_topic(max_chat_id)
+                    existing_thread = None
+                else:
+                    raise
 
         # Отправляем первое сообщение в MAX (это создаёт диалог).
         send_text = first_text or "👋"
