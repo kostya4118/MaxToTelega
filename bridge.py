@@ -1193,7 +1193,11 @@ class Account:
         if user is None:
             await hint.edit_text(
                 "❌ Пользователь не найден.\n\n"
-                "Напиши номер телефона (+79991234567) или username из MAX."
+                "Варианты:\n"
+                "• Номер телефона: +79991234567\n"
+                "• Username MAX: someusername\n"
+                "• MAX user ID (число): 123456789\n\n"
+                "Если знаешь MAX user ID — введи его напрямую, это самый надёжный способ."
             )
             return
 
@@ -1253,52 +1257,103 @@ class Account:
 
         Возвращает объект user (с полем contact.id) или None.
         """
-        # 1) Попытка по телефону через API.
-        if PHONE_RE.match(query) or (query.isdigit() and len(query) >= 7):
-            phone = query if query.startswith("+") else f"+{query}"
-            try:
-                user = await self.client.get_user_by_phone(phone)
-                if user is not None:
-                    return user
-            except AttributeError:
-                pass  # метода нет в этой версии PyMax
-            except Exception:
-                logger.debug("get_user_by_phone(%s) не удался", phone, exc_info=True)
+        tried: list[str] = []
 
-        # 2) Попытка через числовой ID (если query — число).
-        if query.lstrip("+").isdigit():
+        # 1) Числовой MAX user ID — самый надёжный способ.
+        raw_digits = query.lstrip("+")
+        if raw_digits.isdigit():
+            uid = int(raw_digits)
+            tried.append(f"get_user({uid})")
             try:
-                uid = int(query.lstrip("+"))
                 user = await self.client.get_user(uid)
                 if user is not None:
+                    logger.info("[%s] _find_max_user: нашли через get_user(%s)", self.name, uid)
                     return user
             except Exception:
-                logger.debug("get_user(%s) не удался", query, exc_info=True)
+                logger.debug("get_user(%s) не удался", uid, exc_info=True)
 
-        # 3) Поиск по username/ссылке среди известных чатов и контактов.
+        # 2) Поиск по телефону через API (если метод есть в этой версии PyMax).
+        is_phone = PHONE_RE.match(query) or (raw_digits.isdigit() and len(raw_digits) >= 7)
+        if is_phone:
+            phone = query if query.startswith("+") else f"+{raw_digits}"
+            for method_name in ("get_user_by_phone", "find_user_by_phone", "resolve_phone"):
+                method = getattr(self.client, method_name, None)
+                if not callable(method):
+                    continue
+                tried.append(f"{method_name}({phone})")
+                try:
+                    user = await method(phone)
+                    if user is not None:
+                        logger.info("[%s] _find_max_user: нашли через %s", self.name, method_name)
+                        return user
+                except Exception:
+                    logger.debug("%s(%s) не удался", method_name, phone, exc_info=True)
+
+        # 3) Поиск среди известных чатов (кэш + свежая загрузка).
         q = query.lower().lstrip("@")
+        # Пробуем обновить список чатов, если метод есть.
+        for fetch_name in ("get_chats", "update_chats", "load_chats"):
+            fetch = getattr(self.client, fetch_name, None)
+            if callable(fetch):
+                try:
+                    await fetch()
+                    break
+                except Exception:
+                    pass
+
+        tried.append("scan_chats_cache")
         for chat in self.client.chats or []:
             for uid in chat.participants or {}:
                 if uid == self._my_id():
                     continue
                 cached = self.client.get_cached_user(uid)
                 if cached is None:
+                    try:
+                        cached = await self.client.get_user(uid)
+                    except Exception:
+                        continue
+                if cached is None:
                     continue
                 link = (getattr(cached, "link", None) or "").lower().strip("/").split("/")[-1]
-                phone_raw = str(getattr(cached, "phone", "") or "")
-                if link == q or phone_raw == q.lstrip("+"):
+                phone_raw = str(getattr(cached, "phone", "") or "").lstrip("+")
+                name_str = (self._name_of(cached) or "").lower()
+                if link == q or phone_raw == raw_digits or name_str == q:
+                    logger.info("[%s] _find_max_user: нашли в кэше чатов uid=%s", self.name, uid)
                     return cached
 
-        # 4) Попытка поиска через API (если метод есть).
-        try:
-            results = await self.client.search_users(query)
-            if results:
-                return results[0]
-        except AttributeError:
-            pass
-        except Exception:
-            logger.debug("search_users(%s) не удался", query, exc_info=True)
+        # 4) Универсальный поиск через API.
+        for method_name in ("search_users", "search", "find_users"):
+            method = getattr(self.client, method_name, None)
+            if not callable(method):
+                continue
+            tried.append(f"{method_name}({query!r})")
+            try:
+                results = await method(query)
+                if results:
+                    logger.info("[%s] _find_max_user: нашли через %s", self.name, method_name)
+                    return results[0] if not hasattr(results[0], "users") else results[0].users[0]
+            except Exception:
+                logger.debug("%s(%s) не удался", method_name, query, exc_info=True)
 
+        # 5) Попытка через контакты.
+        for method_name in ("get_contacts", "contacts"):
+            method = getattr(self.client, method_name, None)
+            if not callable(method):
+                continue
+            tried.append(f"{method_name}()")
+            try:
+                contacts = await method()
+                for c in (contacts or []):
+                    link = (getattr(c, "link", None) or "").lower().split("/")[-1]
+                    phone_raw_c = str(getattr(c, "phone", "") or "").lstrip("+")
+                    if link == q or phone_raw_c == raw_digits:
+                        logger.info("[%s] _find_max_user: нашли в контактах", self.name)
+                        return c
+            except Exception:
+                logger.debug("%s не удался", method_name, exc_info=True)
+
+        logger.info("[%s] _find_max_user: не нашли %r, попытки: %s",
+                    self.name, query, tried)
         return None
 
     async def handle_tg_reaction(self, tg_message_id, new_reaction) -> None:
