@@ -292,6 +292,7 @@ class Account:
         group_id: int | None,
         client: Client,
         storage: Storage,
+        manager: "Manager",
         forward_groups: bool = True,
     ) -> None:
         self.bot = bot
@@ -302,6 +303,7 @@ class Account:
         self.group_id = group_id  # привязывается через /bind, может быть None
         self.client = client
         self.storage = storage
+        self.manager = manager
         self.forward_groups = forward_groups
         self._chat_cache: dict[int, object] = {}
         self._topic_lock = asyncio.Lock()
@@ -1237,42 +1239,33 @@ class Account:
                 else:
                     raise
 
-        # Отправляем первое сообщение в MAX (это создаёт диалог).
-        send_text = first_text or "👋"
-        try:
-            sent = await self.client.send_message(
-                chat_id=max_chat_id, text=send_text
-            )
-        except ApiError as e:
-            reason = (
-                getattr(e, "localized_message", None)
-                or getattr(e, "message", None) or str(e)
-            )
-            await hint.edit_text(f"⚠️ MAX не принял сообщение: {reason}")
-            return
-
-        # Создаём тему в Telegram.
-        thread = await self._ensure_thread(max_chat_id, None)
-        if thread is None:
-            await hint.edit_text("⚠️ Сообщение отправлено, но тему создать не удалось.")
-            return
-
-        # Запоминаем исходящее сообщение (для реакций собеседника).
-        if sent is not None and getattr(sent, "id", None) is not None:
-            await self.storage.remember_msg(
-                max_chat_id, sent.id,
-                self.group_id, 0,  # tg_message_id неизвестен — пишем 0
-                "user",
-            )
-
+        # Запрашиваем подтверждение перед отправкой.
         name = self._label_for(user, user_id)
+        send_text = first_text or "👋"
+        self.manager._req_counter += 1
+        req_id = self.manager._req_counter
+        self.manager.pending_chats[req_id] = {
+            "account_id": self.account_id,
+            "max_chat_id": max_chat_id,
+            "user_id": user_id,
+            "name": name,
+            "send_text": send_text,
+        }
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text=f"✅ Отправить «{send_text}»",
+                callback_data=f"newchat_ok:{req_id}",
+            ),
+            InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data=f"newchat_cancel:{req_id}",
+            ),
+        ]])
         await hint.edit_text(
-            f"✅ Чат с «{name}» создан! Пиши в новой теме.\n"
-            + (f'Первое сообщение отправлено: «{send_text}»' if first_text else "")
-        )
-        logger.info(
-            "[%s] Инициирован новый чат MAX %s -> тема %s",
-            self.name, max_chat_id, thread,
+            f"👤 Найден: «{name}» (MAX ID {user_id})\n\n"
+            f"Первое сообщение: «{send_text}»\n\n"
+            "Начать чат?",
+            reply_markup=kb,
         )
 
     async def _find_max_user(self, query: str):
@@ -1473,6 +1466,8 @@ class Manager:
         self.admin_ids: set[int] = set(config.admin_ids)
         self.pending_reqs: dict[int, dict] = {}  # req_id -> {requester, phone}
         self._req_counter = 0
+        # Ожидающие подтверждения новые чаты: req_id -> {account_id, max_chat_id, user_id, name, send_text}
+        self.pending_chats: dict[int, dict] = {}
         # Антифлуд: попытки /add и кулдауны «тяжёлых» команд (по монотонным сек).
         self._add_times: dict[int, list[float]] = {}
         self._cmd_times: dict[tuple[int, str], float] = {}
@@ -1573,6 +1568,7 @@ class Manager:
             group_id=acc["group_id"],
             client=client,
             storage=storage,
+            manager=self,
         )
         self.workers[account_id] = worker
         if acc["group_id"] is not None:
@@ -2023,6 +2019,8 @@ class Manager:
             data = cb.data or ""
             if data.startswith("approve:") or data.startswith("deny:"):
                 await self._handle_approval(cb)
+            elif data.startswith("newchat_ok:") or data.startswith("newchat_cancel:"):
+                await self._handle_newchat(cb)
             else:
                 await cb.answer()
 
@@ -2235,6 +2233,70 @@ class Manager:
             "📲 Запускаю вход в MAX. Сейчас придёт SMS — пришли мне код сюда.",
         )
         await self._start_account(account_id)
+
+    async def _handle_newchat(self, cb: CallbackQuery) -> None:
+        action, _, rid = (cb.data or "").partition(":")
+        req = self.pending_chats.pop(int(rid), None) if rid.isdigit() else None
+        if req is None:
+            await cb.answer("Запрос уже обработан или устарел.")
+            try:
+                await cb.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        worker = self.workers.get(req["account_id"])
+        if action == "newchat_cancel":
+            try:
+                await cb.message.edit_text("❌ Создание чата отменено.")
+            except Exception:
+                pass
+            await cb.answer("Отменено")
+            return
+
+        # Подтверждено — отправляем сообщение и создаём тему.
+        await cb.answer("Создаю чат…")
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        if worker is None:
+            await cb.message.edit_text("⚠️ Аккаунт недоступен.")
+            return
+
+        max_chat_id = req["max_chat_id"]
+        send_text = req["send_text"]
+        name = req["name"]
+
+        try:
+            sent = await worker.client.send_message(chat_id=max_chat_id, text=send_text)
+        except ApiError as e:
+            reason = (
+                getattr(e, "localized_message", None)
+                or getattr(e, "message", None) or str(e)
+            )
+            await cb.message.edit_text(f"⚠️ MAX не принял сообщение: {reason}")
+            return
+
+        thread = await worker._ensure_thread(max_chat_id, None)
+        if thread is None:
+            await cb.message.edit_text("⚠️ Сообщение отправлено, но тему создать не удалось.")
+            return
+
+        if sent is not None and getattr(sent, "id", None) is not None:
+            await worker.storage.remember_msg(
+                max_chat_id, sent.id, worker.group_id, 0, "user",
+            )
+
+        await cb.message.edit_text(
+            f"✅ Чат с «{name}» создан! Пиши в новой теме.\n"
+            f"Первое сообщение: «{send_text}»"
+        )
+        logger.info(
+            "[%s] Инициирован новый чат MAX %s -> тема %s",
+            worker.name, max_chat_id, thread,
+        )
 
     async def _handle_approval(self, cb: CallbackQuery) -> None:
         if cb.from_user.id not in self.admin_ids:
