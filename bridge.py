@@ -145,6 +145,30 @@ if _LOG_FILE:
 
 TG_CAPTION_LIMIT = 1024
 PHONE_RE = re.compile(r"^\+\d{7,15}$")
+
+
+def _normalize_phone(raw: str) -> str | None:
+    """Приводит номер телефона любого формата к +7XXXXXXXXXX.
+
+    Примеры входных форматов:
+      +7 917 427-82-00  →  +79174278200
+      7 917 427 82 00   →  +79174278200
+      89174278200       →  +79174278200
+      79174278200       →  +79174278200
+    """
+    digits = re.sub(r"\D", "", raw)
+    if not digits:
+        return None
+    if digits.startswith("8") and len(digits) == 11:
+        digits = "7" + digits[1:]
+    if not digits.startswith("+"):
+        digits = "+" + digits
+    else:
+        digits = "+" + digits[1:]  # убираем случайный +
+    # Финальная нормализация: digits уже без "+"
+    digits = re.sub(r"\D", "", digits)
+    phone = "+" + digits
+    return phone if PHONE_RE.match(phone) else None
 AUTH_TIMEOUT = 300  # сек на ввод кода/пароля
 TG_UPLOAD_LIMIT = 45 * 1024 * 1024  # запас под лимит бота Telegram (~50 МБ)
 
@@ -1180,9 +1204,39 @@ class Account:
         if not text or text.startswith("/"):
             return
 
-        parts = text.split(maxsplit=1)
-        query = parts[0].lstrip("@")
-        first_text = parts[1] if len(parts) > 1 else ""
+        # Телефон может быть многословным: "7 917 427-82-00 Привет"
+        # Пробуем сначала распарсить весь текст как телефон (возможно с пробелами).
+        # Эвристика: если в тексте есть цифры и нет букв — это телефон целиком.
+        text_digits_only = re.sub(r"\D", "", text)
+        if text_digits_only and not re.search(r"[a-zA-Zа-яёА-ЯЁ]", text):
+            # Всё — цифры/разделители: весь текст — номер, текст сообщения пуст
+            normalized = _normalize_phone(text)
+            if normalized:
+                query = normalized
+                first_text = ""
+            else:
+                query = text.split()[0].lstrip("@")
+                first_text = " ".join(text.split()[1:])
+        else:
+            # Ищем граничу между номером и текстом сообщения.
+            # Телефон заканчивается, когда встречаем слово без цифр.
+            tokens = text.split()
+            phone_tokens: list[str] = []
+            rest_tokens: list[str] = []
+            for i, tok in enumerate(tokens):
+                if re.search(r"\d", tok) or tok.startswith("+"):
+                    phone_tokens.append(tok)
+                else:
+                    rest_tokens = tokens[i:]
+                    break
+            raw_phone = " ".join(phone_tokens)
+            normalized = _normalize_phone(raw_phone) if phone_tokens else None
+            if normalized:
+                query = normalized
+                first_text = " ".join(rest_tokens)
+            else:
+                query = tokens[0].lstrip("@")
+                first_text = " ".join(tokens[1:])
 
         hint = await message.reply("🔍 Ищу пользователя в MAX…")
 
