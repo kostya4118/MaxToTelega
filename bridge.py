@@ -145,6 +145,10 @@ if _LOG_FILE:
 
 TG_CAPTION_LIMIT = 1024
 PHONE_RE = re.compile(r"^\+\d{7,15}$")
+MAX_LINK_RE = re.compile(
+    r"https?://(?:[\w.-]*\.)?(?:max\.ru|oneme\.ru|o\.ru)/\S+",
+    re.IGNORECASE,
+)
 
 
 def _normalize_phone(raw: str) -> str | None:
@@ -1204,6 +1208,12 @@ class Account:
         if not text or text.startswith("/"):
             return
 
+        # Ссылка-приглашение в канал/группу MAX.
+        m = MAX_LINK_RE.search(text)
+        if m:
+            await self._handle_invite_link(message, m.group(0))
+            return
+
         # Телефон может быть многословным: "7 917 427-82-00 Привет"
         # Пробуем сначала распарсить весь текст как телефон (возможно с пробелами).
         # Эвристика: если в тексте есть цифры и нет букв — это телефон целиком.
@@ -1319,6 +1329,50 @@ class Account:
             f"👤 Найден: «{name}» (MAX ID {user_id})\n\n"
             f"Первое сообщение: «{send_text}»\n\n"
             "Начать чат?",
+            reply_markup=kb,
+        )
+
+    async def _handle_invite_link(self, message: TgMessage, link: str) -> None:
+        """Обработка ссылки-приглашения MAX в General-теме."""
+        hint = await message.reply("🔍 Получаю информацию о канале/группе…")
+        try:
+            chat = await self.client.resolve_group_by_link(link)
+        except Exception as e:
+            await hint.edit_text(f"⚠️ Не удалось получить информацию: {e}")
+            return
+
+        if chat is None:
+            await hint.edit_text("❌ Ссылка не распознана или недействительна.")
+            return
+
+        title = getattr(chat, "title", None) or f"чат {getattr(chat, 'id', '?')}"
+        chat_type = getattr(chat, "type", None)
+        type_label = "канал" if str(chat_type).upper() == "CHANNEL" else "группа"
+        members = getattr(chat, "members_count", None)
+        members_str = f" · {members} участников" if members else ""
+
+        self.manager._req_counter += 1
+        req_id = self.manager._req_counter
+        self.manager.pending_joins[req_id] = {
+            "account_id": self.account_id,
+            "link": link,
+            "title": title,
+            "chat_type": str(chat_type).upper() if chat_type else "",
+        }
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="✅ Вступить",
+                callback_data=f"joinmax_ok:{req_id}",
+            ),
+            InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data=f"joinmax_cancel:{req_id}",
+            ),
+        ]])
+        await hint.edit_text(
+            f"📢 {type_label.capitalize()}: «{title}»{members_str}\n\n"
+            f"Вступить в этот {type_label}?",
             reply_markup=kb,
         )
 
@@ -1522,6 +1576,8 @@ class Manager:
         self._req_counter = 0
         # Ожидающие подтверждения новые чаты: req_id -> {account_id, max_chat_id, user_id, name, send_text}
         self.pending_chats: dict[int, dict] = {}
+        # Ожидающие подтверждения вступления в канал/группу MAX: req_id -> {account_id, link, title, chat_type}
+        self.pending_joins: dict[int, dict] = {}
         # Антифлуд: попытки /add и кулдауны «тяжёлых» команд (по монотонным сек).
         self._add_times: dict[int, list[float]] = {}
         self._cmd_times: dict[tuple[int, str], float] = {}
@@ -2075,6 +2131,8 @@ class Manager:
                 await self._handle_approval(cb)
             elif data.startswith("newchat_ok:") or data.startswith("newchat_cancel:"):
                 await self._handle_newchat(cb)
+            elif data.startswith("joinmax_ok:") or data.startswith("joinmax_cancel:"):
+                await self._handle_join(cb)
             else:
                 await cb.answer()
 
@@ -2350,6 +2408,63 @@ class Manager:
         logger.info(
             "[%s] Инициирован новый чат MAX %s -> тема %s",
             worker.name, max_chat_id, thread,
+        )
+
+    async def _handle_join(self, cb: CallbackQuery) -> None:
+        action, _, rid = (cb.data or "").partition(":")
+        req = self.pending_joins.pop(int(rid), None) if rid.isdigit() else None
+        if req is None:
+            await cb.answer("Запрос уже обработан или устарел.")
+            try:
+                await cb.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        if action == "joinmax_cancel":
+            try:
+                await cb.message.edit_text("❌ Вступление отменено.")
+            except Exception:
+                pass
+            await cb.answer("Отменено")
+            return
+
+        await cb.answer("Вступаю…")
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        worker = self.workers.get(req["account_id"])
+        if worker is None:
+            await cb.message.edit_text("⚠️ Аккаунт недоступен.")
+            return
+
+        link = req["link"]
+        title = req["title"]
+        chat_type = req["chat_type"]
+
+        try:
+            if chat_type == "CHANNEL":
+                chat = await worker.client.join_channel(link)
+            else:
+                chat = await worker.client.join_group(link)
+        except Exception as e:
+            await cb.message.edit_text(f"⚠️ Не удалось вступить: {e}")
+            return
+
+        joined_title = (
+            getattr(chat, "title", None) or title
+            if chat is not None else title
+        )
+        type_label = "канал" if chat_type == "CHANNEL" else "группа"
+        await cb.message.edit_text(
+            f"✅ Вступил в {type_label} «{joined_title}»!\n\n"
+            "Сообщения появятся новой темой как только придут."
+        )
+        logger.info(
+            "[%s] Вступил в %s «%s» по ссылке %s",
+            worker.name, type_label, joined_title, link,
         )
 
     async def _handle_approval(self, cb: CallbackQuery) -> None:
