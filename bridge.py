@@ -1473,6 +1473,56 @@ class Account:
             if muted else f"🔔 Чат «{title}» — снова со звуком."
         )
 
+    async def confirm_leave(self, message: TgMessage, manager: "Manager") -> None:
+        """Показывает подтверждение выхода из MAX-канала/группы."""
+        thread = message.message_thread_id
+        if thread is None:
+            await message.reply("Команду /leave отправь внутри нужной темы.")
+            return
+        max_chat_id = await self.storage.chat_by_thread(thread)
+        if max_chat_id is None:
+            await message.reply("Не могу определить чат MAX для этой темы.")
+            return
+
+        title = await self._chat_title_by_id(max_chat_id)
+        chat = await self._get_chat(max_chat_id)
+        chat_type = str(getattr(chat, "type", "") or "").upper()
+
+        if chat_type == "DIALOG":
+            await message.reply(
+                "Это личный чат — выйти нельзя. "
+                "Чтобы удалить историю используй /remove N в личке с ботом."
+            )
+            return
+
+        type_label = "канал" if chat_type == "CHANNEL" else "группа"
+
+        manager._req_counter += 1
+        req_id = manager._req_counter
+        manager.pending_leaves[req_id] = {
+            "account_id": self.account_id,
+            "max_chat_id": max_chat_id,
+            "thread_id": thread,
+            "title": title,
+            "chat_type": chat_type,
+        }
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text=f"✅ Выйти из «{title}»",
+                callback_data=f"leavechat_ok:{req_id}",
+            ),
+            InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data=f"leavechat_cancel:{req_id}",
+            ),
+        ]])
+        await message.reply(
+            f"⚠️ Выйти из {type_label}а «{title}»?\n\n"
+            "Тема в Telegram будет закрыта, история переписки останется.",
+            reply_markup=kb,
+        )
+
     async def list_muted(self, message: TgMessage) -> None:
         ids = await self.storage.list_muted()
         if not ids:
@@ -1578,6 +1628,8 @@ class Manager:
         self.pending_chats: dict[int, dict] = {}
         # Ожидающие подтверждения вступления в канал/группу MAX: req_id -> {account_id, link, title, chat_type}
         self.pending_joins: dict[int, dict] = {}
+        # Ожидающие подтверждения выхода: req_id -> {account_id, max_chat_id, thread_id, title, chat_type}
+        self.pending_leaves: dict[int, dict] = {}
         # Антифлуд: попытки /add и кулдауны «тяжёлых» команд (по монотонным сек).
         self._add_times: dict[int, list[float]] = {}
         self._cmd_times: dict[tuple[int, str], float] = {}
@@ -1999,6 +2051,10 @@ class Manager:
                 "приходить сюда отдельными темами."
             )
 
+        @dp.message(Command("leave"))
+        async def cmd_leave(message: TgMessage) -> None:
+            await self._route_command(message, "leave")
+
         @dp.message(Command("mute"))
         async def cmd_mute(message: TgMessage) -> None:
             await self._route_command(message, "mute")
@@ -2133,6 +2189,8 @@ class Manager:
                 await self._handle_newchat(cb)
             elif data.startswith("joinmax_ok:") or data.startswith("joinmax_cancel:"):
                 await self._handle_join(cb)
+            elif data.startswith("leavechat_ok:") or data.startswith("leavechat_cancel:"):
+                await self._handle_leave(cb)
             else:
                 await cb.answer()
 
@@ -2173,7 +2231,9 @@ class Manager:
         if worker is None or message.from_user.id != worker.owner_tg_id:
             await message.reply("Эта команда работает в группе твоего аккаунта.")
             return
-        if cmd == "mute":
+        if cmd == "leave":
+            await worker.confirm_leave(message, self)
+        elif cmd == "mute":
             await worker.toggle_mute(message, muted=True)
         elif cmd == "unmute":
             await worker.toggle_mute(message, muted=False)
@@ -2408,6 +2468,70 @@ class Manager:
         logger.info(
             "[%s] Инициирован новый чат MAX %s -> тема %s",
             worker.name, max_chat_id, thread,
+        )
+
+    async def _handle_leave(self, cb: CallbackQuery) -> None:
+        action, _, rid = (cb.data or "").partition(":")
+        req = self.pending_leaves.pop(int(rid), None) if rid.isdigit() else None
+        if req is None:
+            await cb.answer("Запрос уже обработан или устарел.")
+            try:
+                await cb.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        if action == "leavechat_cancel":
+            try:
+                await cb.message.edit_text("❌ Выход отменён.")
+            except Exception:
+                pass
+            await cb.answer("Отменено")
+            return
+
+        await cb.answer("Выхожу…")
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        worker = self.workers.get(req["account_id"])
+        if worker is None:
+            await cb.message.edit_text("⚠️ Аккаунт недоступен.")
+            return
+
+        max_chat_id = req["max_chat_id"]
+        thread_id = req["thread_id"]
+        title = req["title"]
+        chat_type = req["chat_type"]
+        type_label = "канал" if chat_type == "CHANNEL" else "группа"
+        group_id = worker.group_id
+
+        try:
+            if chat_type == "CHANNEL":
+                await worker.client.leave_channel(max_chat_id)
+            else:
+                await worker.client.leave_group(max_chat_id)
+        except Exception as e:
+            await cb.message.edit_text(f"⚠️ Не удалось выйти: {e}")
+            return
+
+        # Чистим маппинг темы.
+        await worker.storage.clear_topic(max_chat_id)
+
+        # Закрываем тему в Telegram.
+        if group_id is not None:
+            try:
+                await self.bot.close_forum_topic(group_id, thread_id)
+            except Exception:
+                logger.debug("Не удалось закрыть тему %s", thread_id, exc_info=True)
+
+        await cb.message.edit_text(
+            f"✅ Вышел из {type_label}а «{title}». Тема закрыта."
+        )
+        logger.info(
+            "[%s] Вышел из %s «%s» (max_chat_id=%s)",
+            worker.name, type_label, title, max_chat_id,
         )
 
     async def _handle_join(self, cb: CallbackQuery) -> None:
