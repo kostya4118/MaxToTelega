@@ -1473,6 +1473,111 @@ class Account:
             if muted else f"🔔 Чат «{title}» — снова со звуком."
         )
 
+    async def cmd_dm(self, message: TgMessage, manager: "Manager") -> None:
+        """Открыть личный чат с отправителем сообщения, на которое сделан реплей."""
+        reply = message.reply_to_message
+        if reply is None:
+            await message.reply(
+                "Сделай реплей на сообщение участника и напиши /dm."
+            )
+            return
+
+        thread = message.message_thread_id
+        max_chat_id = await self.storage.chat_by_thread(thread) if thread else None
+        if max_chat_id is None:
+            await message.reply("Не могу определить чат MAX для этой темы.")
+            return
+
+        # Ищем MAX-сообщение по Telegram message_id реплея.
+        pair = await self.storage.max_msg_by_tg(message.chat.id, reply.message_id)
+        if pair is None:
+            await message.reply(
+                "Не нашёл это сообщение в базе — возможно, оно слишком старое."
+            )
+            return
+        _, max_message_id = pair
+
+        hint = await message.reply("🔍 Определяю отправителя…")
+
+        # Получаем MAX-сообщение чтобы узнать sender.
+        try:
+            max_msg = await self.client.get_message(max_chat_id, max_message_id)
+        except Exception as e:
+            await hint.edit_text(f"⚠️ Не удалось получить сообщение MAX: {e}")
+            return
+
+        if max_msg is None or max_msg.sender is None:
+            await hint.edit_text("❌ Не удалось определить отправителя.")
+            return
+
+        sender_id: int = max_msg.sender
+
+        # Не открываем лс с самим собой.
+        if sender_id == self._my_id():
+            await hint.edit_text("Это твоё собственное сообщение.")
+            return
+
+        # Получаем имя пользователя.
+        try:
+            user = await self.client.get_user(sender_id)
+        except Exception:
+            user = None
+        name = self._label_for(user, sender_id) if user else f"ID {sender_id}"
+
+        me = self.client.me
+        if me is None:
+            await hint.edit_text("⚠️ Аккаунт MAX ещё не готов.")
+            return
+        my_id = me.contact.id if getattr(me, "contact", None) else getattr(me, "id", None)
+        if my_id is None:
+            await hint.edit_text("⚠️ Не удалось определить ID аккаунта.")
+            return
+
+        dm_chat_id = my_id ^ sender_id
+
+        # Проверяем, есть ли уже тема.
+        existing_thread = await self.storage.get_topic(dm_chat_id)
+        if existing_thread is not None:
+            try:
+                probe = await self.bot.send_message(
+                    self.group_id, "…", message_thread_id=existing_thread
+                )
+                await self.bot.delete_message(self.group_id, probe.message_id)
+                await hint.edit_text(
+                    f"💬 Личный чат с «{name}» уже есть — тема #{existing_thread}."
+                )
+                return
+            except TelegramBadRequest as e:
+                if "thread not found" in str(e).lower():
+                    await self.storage.clear_topic(dm_chat_id)
+                else:
+                    raise
+
+        # Запрашиваем подтверждение.
+        manager._req_counter += 1
+        req_id = manager._req_counter
+        manager.pending_chats[req_id] = {
+            "account_id": self.account_id,
+            "max_chat_id": dm_chat_id,
+            "user_id": sender_id,
+            "name": name,
+            "send_text": "👋",
+        }
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text=f"✅ Написать «{name}»",
+                callback_data=f"newchat_ok:{req_id}",
+            ),
+            InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data=f"newchat_cancel:{req_id}",
+            ),
+        ]])
+        await hint.edit_text(
+            f"👤 Открыть личный чат с «{name}»?",
+            reply_markup=kb,
+        )
+
     async def confirm_leave(self, message: TgMessage, manager: "Manager") -> None:
         """Показывает подтверждение выхода из MAX-канала/группы."""
         thread = message.message_thread_id
@@ -2051,6 +2156,10 @@ class Manager:
                 "приходить сюда отдельными темами."
             )
 
+        @dp.message(Command("dm"))
+        async def cmd_dm(message: TgMessage) -> None:
+            await self._route_command(message, "dm")
+
         @dp.message(Command("leave"))
         async def cmd_leave(message: TgMessage) -> None:
             await self._route_command(message, "leave")
@@ -2231,7 +2340,9 @@ class Manager:
         if worker is None or message.from_user.id != worker.owner_tg_id:
             await message.reply("Эта команда работает в группе твоего аккаунта.")
             return
-        if cmd == "leave":
+        if cmd == "dm":
+            await worker.cmd_dm(message, self)
+        elif cmd == "leave":
             await worker.confirm_leave(message, self)
         elif cmd == "mute":
             await worker.toggle_mute(message, muted=True)
