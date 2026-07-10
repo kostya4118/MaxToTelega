@@ -145,6 +145,10 @@ if _LOG_FILE:
 
 TG_CAPTION_LIMIT = 1024
 PHONE_RE = re.compile(r"^\+\d{7,15}$")
+MAX_LINK_RE = re.compile(
+    r"https?://(?:[\w.-]*\.)?(?:max\.ru|oneme\.ru|o\.ru)/\S+",
+    re.IGNORECASE,
+)
 
 
 def _normalize_phone(raw: str) -> str | None:
@@ -1204,6 +1208,12 @@ class Account:
         if not text or text.startswith("/"):
             return
 
+        # Ссылка-приглашение в канал/группу MAX.
+        m = MAX_LINK_RE.search(text)
+        if m:
+            await self._handle_invite_link(message, m.group(0))
+            return
+
         # Телефон может быть многословным: "7 917 427-82-00 Привет"
         # Пробуем сначала распарсить весь текст как телефон (возможно с пробелами).
         # Эвристика: если в тексте есть цифры и нет букв — это телефон целиком.
@@ -1322,6 +1332,50 @@ class Account:
             reply_markup=kb,
         )
 
+    async def _handle_invite_link(self, message: TgMessage, link: str) -> None:
+        """Обработка ссылки-приглашения MAX в General-теме."""
+        hint = await message.reply("🔍 Получаю информацию о канале/группе…")
+        try:
+            chat = await self.client.resolve_group_by_link(link)
+        except Exception as e:
+            await hint.edit_text(f"⚠️ Не удалось получить информацию: {e}")
+            return
+
+        if chat is None:
+            await hint.edit_text("❌ Ссылка не распознана или недействительна.")
+            return
+
+        title = getattr(chat, "title", None) or f"чат {getattr(chat, 'id', '?')}"
+        chat_type = getattr(chat, "type", None)
+        type_label = "канал" if str(chat_type).upper() == "CHANNEL" else "группа"
+        members = getattr(chat, "members_count", None)
+        members_str = f" · {members} участников" if members else ""
+
+        self.manager._req_counter += 1
+        req_id = self.manager._req_counter
+        self.manager.pending_joins[req_id] = {
+            "account_id": self.account_id,
+            "link": link,
+            "title": title,
+            "chat_type": str(chat_type).upper() if chat_type else "",
+        }
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="✅ Вступить",
+                callback_data=f"joinmax_ok:{req_id}",
+            ),
+            InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data=f"joinmax_cancel:{req_id}",
+            ),
+        ]])
+        await hint.edit_text(
+            f"📢 {type_label.capitalize()}: «{title}»{members_str}\n\n"
+            f"Вступить в этот {type_label}?",
+            reply_markup=kb,
+        )
+
     async def _find_max_user(self, query: str):
         """Ищет пользователя MAX по телефону (+7…) или username/ссылке.
 
@@ -1417,6 +1471,161 @@ class Account:
         await message.reply(
             f"🔕 Чат «{title}» — теперь без звука."
             if muted else f"🔔 Чат «{title}» — снова со звуком."
+        )
+
+    async def cmd_dm(self, message: TgMessage, manager: "Manager") -> None:
+        """Открыть личный чат с отправителем сообщения, на которое сделан реплей."""
+        reply = message.reply_to_message
+        if reply is None:
+            await message.reply(
+                "Сделай реплей на сообщение участника и напиши /dm."
+            )
+            return
+
+        thread = message.message_thread_id
+        max_chat_id = await self.storage.chat_by_thread(thread) if thread else None
+        if max_chat_id is None:
+            await message.reply("Не могу определить чат MAX для этой темы.")
+            return
+
+        # Ищем MAX-сообщение по Telegram message_id реплея.
+        pair = await self.storage.max_msg_by_tg(message.chat.id, reply.message_id)
+        if pair is None:
+            await message.reply(
+                "Не нашёл это сообщение в базе — возможно, оно слишком старое."
+            )
+            return
+        _, max_message_id = pair
+
+        hint = await message.reply("🔍 Определяю отправителя…")
+
+        # Получаем MAX-сообщение чтобы узнать sender.
+        try:
+            max_msg = await self.client.get_message(max_chat_id, max_message_id)
+        except Exception as e:
+            await hint.edit_text(f"⚠️ Не удалось получить сообщение MAX: {e}")
+            return
+
+        if max_msg is None or max_msg.sender is None:
+            await hint.edit_text("❌ Не удалось определить отправителя.")
+            return
+
+        sender_id: int = max_msg.sender
+
+        # Не открываем лс с самим собой.
+        if sender_id == self._my_id():
+            await hint.edit_text("Это твоё собственное сообщение.")
+            return
+
+        # Получаем имя пользователя.
+        try:
+            user = await self.client.get_user(sender_id)
+        except Exception:
+            user = None
+        name = self._label_for(user, sender_id) if user else f"ID {sender_id}"
+
+        me = self.client.me
+        if me is None:
+            await hint.edit_text("⚠️ Аккаунт MAX ещё не готов.")
+            return
+        my_id = me.contact.id if getattr(me, "contact", None) else getattr(me, "id", None)
+        if my_id is None:
+            await hint.edit_text("⚠️ Не удалось определить ID аккаунта.")
+            return
+
+        dm_chat_id = my_id ^ sender_id
+
+        # Проверяем, есть ли уже тема.
+        existing_thread = await self.storage.get_topic(dm_chat_id)
+        if existing_thread is not None:
+            try:
+                probe = await self.bot.send_message(
+                    self.group_id, "…", message_thread_id=existing_thread
+                )
+                await self.bot.delete_message(self.group_id, probe.message_id)
+                await hint.edit_text(
+                    f"💬 Личный чат с «{name}» уже есть — тема #{existing_thread}."
+                )
+                return
+            except TelegramBadRequest as e:
+                if "thread not found" in str(e).lower():
+                    await self.storage.clear_topic(dm_chat_id)
+                else:
+                    raise
+
+        # Запрашиваем подтверждение.
+        manager._req_counter += 1
+        req_id = manager._req_counter
+        manager.pending_chats[req_id] = {
+            "account_id": self.account_id,
+            "max_chat_id": dm_chat_id,
+            "user_id": sender_id,
+            "name": name,
+            "send_text": "👋",
+        }
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text=f"✅ Написать «{name}»",
+                callback_data=f"newchat_ok:{req_id}",
+            ),
+            InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data=f"newchat_cancel:{req_id}",
+            ),
+        ]])
+        await hint.edit_text(
+            f"👤 Открыть личный чат с «{name}»?",
+            reply_markup=kb,
+        )
+
+    async def confirm_leave(self, message: TgMessage, manager: "Manager") -> None:
+        """Показывает подтверждение выхода из MAX-канала/группы."""
+        thread = message.message_thread_id
+        if thread is None:
+            await message.reply("Команду /leave отправь внутри нужной темы.")
+            return
+        max_chat_id = await self.storage.chat_by_thread(thread)
+        if max_chat_id is None:
+            await message.reply("Не могу определить чат MAX для этой темы.")
+            return
+
+        title = await self._chat_title_by_id(max_chat_id)
+        chat = await self._get_chat(max_chat_id)
+        chat_type = str(getattr(chat, "type", "") or "").upper()
+
+        if chat_type == "DIALOG":
+            await message.reply(
+                "Это личный чат — выйти нельзя. "
+                "Чтобы удалить историю используй /remove N в личке с ботом."
+            )
+            return
+
+        type_label = "канал" if chat_type == "CHANNEL" else "группа"
+
+        manager._req_counter += 1
+        req_id = manager._req_counter
+        manager.pending_leaves[req_id] = {
+            "account_id": self.account_id,
+            "max_chat_id": max_chat_id,
+            "thread_id": thread,
+            "title": title,
+            "chat_type": chat_type,
+        }
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text=f"✅ Выйти из «{title}»",
+                callback_data=f"leavechat_ok:{req_id}",
+            ),
+            InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data=f"leavechat_cancel:{req_id}",
+            ),
+        ]])
+        await message.reply(
+            f"⚠️ Выйти из {type_label}а «{title}»?\n\n"
+            "Тема в Telegram будет закрыта, история переписки останется.",
+            reply_markup=kb,
         )
 
     async def list_muted(self, message: TgMessage) -> None:
@@ -1522,6 +1731,10 @@ class Manager:
         self._req_counter = 0
         # Ожидающие подтверждения новые чаты: req_id -> {account_id, max_chat_id, user_id, name, send_text}
         self.pending_chats: dict[int, dict] = {}
+        # Ожидающие подтверждения вступления в канал/группу MAX: req_id -> {account_id, link, title, chat_type}
+        self.pending_joins: dict[int, dict] = {}
+        # Ожидающие подтверждения выхода: req_id -> {account_id, max_chat_id, thread_id, title, chat_type}
+        self.pending_leaves: dict[int, dict] = {}
         # Антифлуд: попытки /add и кулдауны «тяжёлых» команд (по монотонным сек).
         self._add_times: dict[int, list[float]] = {}
         self._cmd_times: dict[tuple[int, str], float] = {}
@@ -1943,6 +2156,14 @@ class Manager:
                 "приходить сюда отдельными темами."
             )
 
+        @dp.message(Command("dm"))
+        async def cmd_dm(message: TgMessage) -> None:
+            await self._route_command(message, "dm")
+
+        @dp.message(Command("leave"))
+        async def cmd_leave(message: TgMessage) -> None:
+            await self._route_command(message, "leave")
+
         @dp.message(Command("mute"))
         async def cmd_mute(message: TgMessage) -> None:
             await self._route_command(message, "mute")
@@ -2075,6 +2296,10 @@ class Manager:
                 await self._handle_approval(cb)
             elif data.startswith("newchat_ok:") or data.startswith("newchat_cancel:"):
                 await self._handle_newchat(cb)
+            elif data.startswith("joinmax_ok:") or data.startswith("joinmax_cancel:"):
+                await self._handle_join(cb)
+            elif data.startswith("leavechat_ok:") or data.startswith("leavechat_cancel:"):
+                await self._handle_leave(cb)
             else:
                 await cb.answer()
 
@@ -2115,7 +2340,11 @@ class Manager:
         if worker is None or message.from_user.id != worker.owner_tg_id:
             await message.reply("Эта команда работает в группе твоего аккаунта.")
             return
-        if cmd == "mute":
+        if cmd == "dm":
+            await worker.cmd_dm(message, self)
+        elif cmd == "leave":
+            await worker.confirm_leave(message, self)
+        elif cmd == "mute":
             await worker.toggle_mute(message, muted=True)
         elif cmd == "unmute":
             await worker.toggle_mute(message, muted=False)
@@ -2350,6 +2579,127 @@ class Manager:
         logger.info(
             "[%s] Инициирован новый чат MAX %s -> тема %s",
             worker.name, max_chat_id, thread,
+        )
+
+    async def _handle_leave(self, cb: CallbackQuery) -> None:
+        action, _, rid = (cb.data or "").partition(":")
+        req = self.pending_leaves.pop(int(rid), None) if rid.isdigit() else None
+        if req is None:
+            await cb.answer("Запрос уже обработан или устарел.")
+            try:
+                await cb.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        if action == "leavechat_cancel":
+            try:
+                await cb.message.edit_text("❌ Выход отменён.")
+            except Exception:
+                pass
+            await cb.answer("Отменено")
+            return
+
+        await cb.answer("Выхожу…")
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        worker = self.workers.get(req["account_id"])
+        if worker is None:
+            await cb.message.edit_text("⚠️ Аккаунт недоступен.")
+            return
+
+        max_chat_id = req["max_chat_id"]
+        thread_id = req["thread_id"]
+        title = req["title"]
+        chat_type = req["chat_type"]
+        type_label = "канал" if chat_type == "CHANNEL" else "группа"
+        group_id = worker.group_id
+
+        try:
+            if chat_type == "CHANNEL":
+                await worker.client.leave_channel(max_chat_id)
+            else:
+                await worker.client.leave_group(max_chat_id)
+        except Exception as e:
+            await cb.message.edit_text(f"⚠️ Не удалось выйти: {e}")
+            return
+
+        # Чистим маппинг темы.
+        await worker.storage.clear_topic(max_chat_id)
+
+        # Закрываем тему в Telegram.
+        if group_id is not None:
+            try:
+                await self.bot.close_forum_topic(group_id, thread_id)
+            except Exception:
+                logger.debug("Не удалось закрыть тему %s", thread_id, exc_info=True)
+
+        await cb.message.edit_text(
+            f"✅ Вышел из {type_label}а «{title}». Тема закрыта."
+        )
+        logger.info(
+            "[%s] Вышел из %s «%s» (max_chat_id=%s)",
+            worker.name, type_label, title, max_chat_id,
+        )
+
+    async def _handle_join(self, cb: CallbackQuery) -> None:
+        action, _, rid = (cb.data or "").partition(":")
+        req = self.pending_joins.pop(int(rid), None) if rid.isdigit() else None
+        if req is None:
+            await cb.answer("Запрос уже обработан или устарел.")
+            try:
+                await cb.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        if action == "joinmax_cancel":
+            try:
+                await cb.message.edit_text("❌ Вступление отменено.")
+            except Exception:
+                pass
+            await cb.answer("Отменено")
+            return
+
+        await cb.answer("Вступаю…")
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        worker = self.workers.get(req["account_id"])
+        if worker is None:
+            await cb.message.edit_text("⚠️ Аккаунт недоступен.")
+            return
+
+        link = req["link"]
+        title = req["title"]
+        chat_type = req["chat_type"]
+
+        try:
+            if chat_type == "CHANNEL":
+                chat = await worker.client.join_channel(link)
+            else:
+                chat = await worker.client.join_group(link)
+        except Exception as e:
+            await cb.message.edit_text(f"⚠️ Не удалось вступить: {e}")
+            return
+
+        joined_title = (
+            getattr(chat, "title", None) or title
+            if chat is not None else title
+        )
+        type_label = "канал" if chat_type == "CHANNEL" else "группа"
+        await cb.message.edit_text(
+            f"✅ Вступил в {type_label} «{joined_title}»!\n\n"
+            "Сообщения появятся новой темой как только придут."
+        )
+        logger.info(
+            "[%s] Вступил в %s «%s» по ссылке %s",
+            worker.name, type_label, joined_title, link,
         )
 
     async def _handle_approval(self, cb: CallbackQuery) -> None:
