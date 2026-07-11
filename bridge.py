@@ -1322,8 +1322,16 @@ class Account:
                 )
                 await self.bot.delete_message(self.group_id, probe.message_id)
                 name = self._label_for(user, user_id)
+                topic_link = (
+                    f"https://t.me/c/{str(self.group_id).lstrip('-100')}/{existing_thread}"
+                    if self.group_id else None
+                )
+                kb = InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="💬 Открыть тему", url=topic_link)
+                ]]) if topic_link else None
                 await hint.edit_text(
-                    f"💬 Чат с «{name}» уже есть — тема #{existing_thread}."
+                    f"💬 Чат с «{name}» уже есть.",
+                    reply_markup=kb,
                 )
                 return
             except TelegramBadRequest as e:
@@ -1588,8 +1596,16 @@ class Account:
                     self.group_id, "…", message_thread_id=existing_thread
                 )
                 await self.bot.delete_message(self.group_id, probe.message_id)
+                topic_link = (
+                    f"https://t.me/c/{str(self.group_id).lstrip('-100')}/{existing_thread}"
+                    if self.group_id else None
+                )
+                kb = InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="💬 Открыть тему", url=topic_link)
+                ]]) if topic_link else None
                 await hint.edit_text(
-                    f"💬 Личный чат с «{name}» уже есть — тема #{existing_thread}."
+                    f"💬 Личный чат с «{name}» уже есть.",
+                    reply_markup=kb,
                 )
                 return
             except TelegramBadRequest as e:
