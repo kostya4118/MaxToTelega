@@ -223,6 +223,36 @@ def _encrypt_file(path: str, passphrase: str) -> str:
     return enc
 
 
+def _decrypt_file(path: str, passphrase: str) -> str:
+    """Расшифровывает .enc-файл. Возвращает путь к расшифрованному файлу."""
+    from cryptography.fernet import Fernet
+
+    with open(path, "rb") as f:
+        magic = f.read(len(_ENC_MAGIC))
+        if magic != _ENC_MAGIC:
+            raise ValueError("Файл не является зашифрованным бэкапом бота.")
+        salt = f.read(16)
+        token = f.read()
+    out = path.removesuffix(".enc") if path.endswith(".enc") else path + ".dec"
+    data = Fernet(_derive_key(passphrase, salt)).decrypt(token)
+    with open(out, "wb") as f:
+        f.write(data)
+    return out
+
+
+def _restore_backup(archive: str, work_dir: str) -> list[str]:
+    """Распаковывает *.db из бэкапа в work_dir. Возвращает список восстановленных файлов."""
+    restored = []
+    with tarfile.open(archive, "r:gz") as tar:
+        for member in tar.getmembers():
+            if not member.name.endswith(".db"):
+                continue
+            member.name = os.path.basename(member.name)
+            tar.extract(member, path=work_dir)
+            restored.append(member.name)
+    return restored
+
+
 def _sqlite_snapshot(src: str, dst: str) -> None:
     """Консистентная копия SQLite-файла даже при открытом соединении."""
     source = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
@@ -1292,8 +1322,16 @@ class Account:
                 )
                 await self.bot.delete_message(self.group_id, probe.message_id)
                 name = self._label_for(user, user_id)
+                topic_link = (
+                    f"https://t.me/c/{str(self.group_id).lstrip('-100')}/{existing_thread}"
+                    if self.group_id else None
+                )
+                kb = InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="💬 Открыть тему", url=topic_link)
+                ]]) if topic_link else None
                 await hint.edit_text(
-                    f"💬 Чат с «{name}» уже есть — тема #{existing_thread}."
+                    f"💬 Чат с «{name}» уже есть.",
+                    reply_markup=kb,
                 )
                 return
             except TelegramBadRequest as e:
@@ -1558,8 +1596,16 @@ class Account:
                     self.group_id, "…", message_thread_id=existing_thread
                 )
                 await self.bot.delete_message(self.group_id, probe.message_id)
+                topic_link = (
+                    f"https://t.me/c/{str(self.group_id).lstrip('-100')}/{existing_thread}"
+                    if self.group_id else None
+                )
+                kb = InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="💬 Открыть тему", url=topic_link)
+                ]]) if topic_link else None
                 await hint.edit_text(
-                    f"💬 Личный чат с «{name}» уже есть — тема #{existing_thread}."
+                    f"💬 Личный чат с «{name}» уже есть.",
+                    reply_markup=kb,
                 )
                 return
             except TelegramBadRequest as e:
@@ -1791,6 +1837,7 @@ class Manager:
         # Антифлуд: попытки /add и кулдауны «тяжёлых» команд (по монотонным сек).
         self._add_times: dict[int, list[float]] = {}
         self._cmd_times: dict[tuple[int, str], float] = {}
+        self._pending_restore: dict | None = None
         self._register_handlers()
 
     # ── антифлуд ──────────────────────────────────────────────────────────
@@ -2360,6 +2407,41 @@ class Manager:
                     "в Telegram, скопируй с сервера вручную)."
                 )
 
+        @dp.message(Command("restore"))
+        async def cmd_restore(message: TgMessage) -> None:
+            if message.from_user.id not in self.admin_ids:
+                return
+            doc = message.document
+            if doc is None:
+                await message.reply(
+                    "📥 Пришли файл бэкапа как документ и напиши /restore в подписи,\n"
+                    "или сначала пришли файл, потом ответь на него /restore.\n\n"
+                    "Форматы: backup_*.tar.gz или backup_*.tar.gz.enc"
+                )
+                return
+            fname = doc.file_name or ""
+            if not (fname.endswith(".tar.gz") or fname.endswith(".tar.gz.enc")):
+                await message.reply("❌ Ожидается файл backup_*.tar.gz или *.tar.gz.enc")
+                return
+            await message.reply(
+                "⚠️ Восстановление перезапишет все базы данных (реестр, сессии, маршрутизацию) "
+                "и перезапустит все аккаунты.\n\n"
+                "Для подтверждения — ответь на это сообщение словом «подтверждаю».",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="✅ Подтвердить восстановление",
+                        callback_data=f"adm:restore_confirm:{message.message_id}",
+                    ),
+                    InlineKeyboardButton(text="❌ Отмена", callback_data="adm:restore_cancel"),
+                ]]),
+            )
+            # Сохраняем file_id для последующего скачивания по callback
+            self._pending_restore = {
+                "file_id": doc.file_id,
+                "fname": fname,
+                "admin_tg": message.from_user.id,
+            }
+
         @dp.message_reaction()
         async def on_tg_reaction(event: MessageReactionUpdated) -> None:
             acc = self.by_group.get(event.chat.id)
@@ -2407,8 +2489,7 @@ class Manager:
                     await self._on_phone(message)
                     return
                 if (
-                    conv.step in ("code", "password")
-                    and conv.future is not None
+                    conv.future is not None
                     and not conv.future.done()
                 ):
                     conv.future.set_result((message.text or "").strip())
@@ -2533,6 +2614,75 @@ class Manager:
             self.config.backup_keep,
             self.config.backup_passphrase,
         )
+
+    async def _do_restore(self, message: TgMessage, file_id: str, fname: str) -> None:
+        """Скачивает бэкап-файл, останавливает всех воркеров, восстанавливает БД, перезапускает."""
+        with tempfile.TemporaryDirectory() as tmp:
+            archive_path = os.path.join(tmp, fname)
+            # Скачиваем файл из Telegram
+            await self.bot.download(file_id, destination=archive_path)
+
+            # Если зашифрован — расшифровываем
+            if archive_path.endswith(".enc"):
+                passphrase = self.config.backup_passphrase
+                if not passphrase:
+                    # Запрашиваем пароль у администратора прямо в чате
+                    passphrase = await self.await_input(
+                        message.chat.id, "restore_pass",
+                        "🔐 Файл зашифрован. Введи пароль (BACKUP_PASSPHRASE):",
+                    )
+                try:
+                    archive_path = await asyncio.to_thread(
+                        _decrypt_file, archive_path, passphrase
+                    )
+                except Exception:
+                    await message.answer("❌ Неверный пароль — не удалось расшифровать.")
+                    return
+
+            # Делаем автобэкап текущего состояния перед перезаписью
+            await message.answer("💾 Делаю бэкап текущего состояния на всякий случай…")
+            try:
+                safety_path = await self._backup_now()
+                await message.answer(f"✅ Текущий бэкап сохранён:\n{safety_path}")
+            except Exception as e:
+                await message.answer(f"⚠️ Не удалось сделать страховочный бэкап: {e}")
+
+            # Останавливаем всех воркеров
+            await message.answer("⏹ Останавливаю все аккаунты…")
+            for acc_id in list(self.workers.keys()):
+                await self._cleanup_account(acc_id, delete=False)
+
+            # Восстанавливаем файлы
+            await message.answer("📂 Восстанавливаю базы данных…")
+            restored = await asyncio.to_thread(
+                _restore_backup, archive_path, self.config.work_dir
+            )
+
+        # Переоткрываем реестр
+        if self.registry:
+            await self.registry.close()
+        self.registry = await Registry.create(self.config.registry_db)
+
+        # Перезапускаем все активные аккаунты из реестра
+        await message.answer("▶️ Перезапускаю аккаунты…")
+        accs = await self.registry.list_all()
+        started = 0
+        for acc in accs:
+            if acc["status"] in ("active", "stopped"):
+                await self.registry.set_status(acc["id"], "active")
+                try:
+                    await self._start_account(acc["id"])
+                    started += 1
+                except Exception as e:
+                    logger.error("Не удалось запустить аккаунт %s: %s", acc["id"], e)
+
+        files_str = "\n".join(f"• {f}" for f in restored) or "—"
+        await message.answer(
+            f"✅ Восстановление завершено!\n\n"
+            f"Файлы:\n{files_str}\n\n"
+            f"Запущено аккаунтов: {started} из {len(accs)}"
+        )
+        logger.info("Восстановление из бэкапа завершено. Файлы: %s", restored)
 
     async def _backup_loop(self) -> None:
         hours = self.config.backup_interval
@@ -2682,9 +2832,18 @@ class Manager:
                 max_chat_id, sent.id, worker.group_id, 0, "user",
             )
 
+        group_id = worker.group_id
+        topic_link = (
+            f"https://t.me/c/{str(group_id).lstrip('-100')}/{thread}"
+            if group_id else None
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="💬 Открыть тему", url=topic_link)
+        ]]) if topic_link else None
         await cb.message.edit_text(
-            f"✅ Чат с «{name}» создан! Пиши в новой теме.\n"
-            f"Первое сообщение: «{send_text}»"
+            f"✅ Чат с «{name}» создан!\n"
+            f"Первое сообщение: «{send_text}»",
+            reply_markup=kb,
         )
         logger.info(
             "[%s] Инициирован новый чат MAX %s -> тема %s",
@@ -2912,6 +3071,32 @@ class Manager:
             account_id = int(parts[2])
             await cb.answer(f"{action} #{account_id}…")
             await self._admin_action(cb.message, action, account_id)
+
+        elif action == "restore_cancel":
+            self._pending_restore = None
+            await cb.answer("Отменено")
+            try:
+                await cb.message.edit_text("❌ Восстановление отменено.")
+            except Exception:
+                pass
+
+        elif action == "restore_confirm":
+            req = self._pending_restore
+            self._pending_restore = None
+            if req is None or req.get("admin_tg") != cb.from_user.id:
+                await cb.answer("Запрос устарел или не для тебя.", show_alert=True)
+                return
+            await cb.answer("Восстанавливаю…")
+            try:
+                await cb.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            await cb.message.answer("📥 Скачиваю бэкап…")
+            try:
+                await self._do_restore(cb.message, req["file_id"], req["fname"])
+            except Exception as e:
+                logger.exception("Восстановление не удалось")
+                await cb.message.answer(f"❌ Ошибка восстановления: {e}")
 
         else:
             await cb.answer()
