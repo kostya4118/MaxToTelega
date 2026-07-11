@@ -2682,9 +2682,18 @@ class Manager:
                 max_chat_id, sent.id, worker.group_id, 0, "user",
             )
 
+        group_id = worker.group_id
+        topic_link = (
+            f"https://t.me/c/{str(group_id).lstrip('-100')}/{thread}"
+            if group_id else None
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="💬 Открыть тему", url=topic_link)
+        ]]) if topic_link else None
         await cb.message.edit_text(
-            f"✅ Чат с «{name}» создан! Пиши в новой теме.\n"
-            f"Первое сообщение: «{send_text}»"
+            f"✅ Чат с «{name}» создан!\n"
+            f"Первое сообщение: «{send_text}»",
+            reply_markup=kb,
         )
         logger.info(
             "[%s] Инициирован новый чат MAX %s -> тема %s",
