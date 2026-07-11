@@ -1491,7 +1491,9 @@ class Account:
         reply = message.reply_to_message
         if reply is None:
             await message.reply(
-                "Сделай реплей на сообщение участника и напиши /dm."
+                "Чтобы написать участнику в личку:\n"
+                "1. Нажми и удержи его сообщение → «Ответить»\n"
+                "2. Отправь /dm"
             )
             return
 
@@ -1591,11 +1593,41 @@ class Account:
             reply_markup=kb,
         )
 
+    async def _leave_picker(self, message: TgMessage, manager: "Manager") -> None:
+        """Список групп/каналов MAX для выбора через кнопки (вызов /leave из General)."""
+        async with self.storage._db.execute(
+            "SELECT max_chat_id, thread_id, title FROM topics ORDER BY thread_id"
+        ) as cur:
+            rows = await cur.fetchall()
+        if not rows:
+            await message.reply("Нет подключённых чатов.")
+            return
+        buttons = []
+        for max_chat_id, thread_id, title in rows:
+            chat = await self._get_chat(max_chat_id)
+            chat_type = str(getattr(chat, "type", "") or "").upper()
+            if chat_type == "DIALOG":
+                continue
+            label = title or await self._chat_title_by_id(max_chat_id)
+            type_icon = "📢" if chat_type == "CHANNEL" else "👥"
+            buttons.append([InlineKeyboardButton(
+                text=f"{type_icon} {label}",
+                callback_data=f"acc:leave_pick:{self.account_id}:{max_chat_id}",
+            )])
+        if not buttons:
+            await message.reply("Нет групп или каналов для выхода (только личные чаты).")
+            return
+        await message.reply(
+            "Из какого чата выйти?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+
     async def confirm_leave(self, message: TgMessage, manager: "Manager") -> None:
         """Показывает подтверждение выхода из MAX-канала/группы."""
         thread = message.message_thread_id
         if thread is None:
-            await message.reply("Команду /leave отправь внутри нужной темы.")
+            # В General — показываем список групп/каналов кнопками
+            await self._leave_picker(message, manager)
             return
         max_chat_id = await self.storage.chat_by_thread(thread)
         if max_chat_id is None:
@@ -2885,7 +2917,7 @@ class Manager:
             await cb.answer()
 
     async def _handle_acc(self, cb: CallbackQuery) -> None:
-        """Кнопки в группе аккаунта: acc:mute:ACCID:CHATID, acc:unmute:ACCID:CHATID."""
+        """Кнопки в группе аккаунта: acc:mute/unmute/leave_pick:ACCID:CHATID."""
         parts = (cb.data or "").split(":")
         if len(parts) < 4:
             await cb.answer()
@@ -2900,6 +2932,44 @@ class Manager:
         worker = self.workers.get(account_id)
         if worker is None or cb.from_user.id != worker.owner_tg_id:
             await cb.answer("Нет доступа.", show_alert=True)
+            return
+
+        if action == "leave_pick":
+            # Показываем подтверждение выхода из выбранного чата
+            await cb.answer()
+            title = await worker._chat_title_by_id(max_chat_id)
+            chat = await worker._get_chat(max_chat_id)
+            chat_type = str(getattr(chat, "type", "") or "").upper()
+            type_label = "канал" if chat_type == "CHANNEL" else "группа"
+
+            self._req_counter += 1
+            req_id = self._req_counter
+            thread_id = await worker.storage.get_topic(max_chat_id)
+            self.pending_leaves[req_id] = {
+                "account_id": account_id,
+                "max_chat_id": max_chat_id,
+                "thread_id": thread_id,
+                "title": title,
+                "chat_type": chat_type,
+            }
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text=f"✅ Выйти из «{title}»",
+                    callback_data=f"leavechat_ok:{req_id}",
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отмена",
+                    callback_data=f"leavechat_cancel:{req_id}",
+                ),
+            ]])
+            try:
+                await cb.message.edit_text(
+                    f"⚠️ Выйти из {type_label}а «{title}»?\n\n"
+                    "Тема в Telegram будет закрыта, история останется.",
+                    reply_markup=kb,
+                )
+            except Exception:
+                pass
             return
 
         muted = action == "mute"
