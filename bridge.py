@@ -1468,17 +1468,32 @@ class Account:
             return
         await self.storage.set_muted(max_chat_id, muted)
         title = await self._chat_title_by_id(max_chat_id)
-        await message.reply(
-            f"🔕 Чат «{title}» — теперь без звука."
-            if muted else f"🔔 Чат «{title}» — снова со звуком."
-        )
+        if muted:
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="🔔 Включить уведомления",
+                    callback_data=f"acc:unmute:{self.account_id}:{max_chat_id}",
+                )
+            ]])
+            text = f"🔕 Чат «{title}» — без звука."
+        else:
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="🔕 Заглушить",
+                    callback_data=f"acc:mute:{self.account_id}:{max_chat_id}",
+                )
+            ]])
+            text = f"🔔 Чат «{title}» — со звуком."
+        await message.reply(text, reply_markup=kb)
 
     async def cmd_dm(self, message: TgMessage, manager: "Manager") -> None:
         """Открыть личный чат с отправителем сообщения, на которое сделан реплей."""
         reply = message.reply_to_message
         if reply is None:
             await message.reply(
-                "Сделай реплей на сообщение участника и напиши /dm."
+                "Чтобы написать участнику в личку:\n"
+                "1. Нажми и удержи его сообщение → «Ответить»\n"
+                "2. Отправь /dm"
             )
             return
 
@@ -1578,11 +1593,41 @@ class Account:
             reply_markup=kb,
         )
 
+    async def _leave_picker(self, message: TgMessage, manager: "Manager") -> None:
+        """Список групп/каналов MAX для выбора через кнопки (вызов /leave из General)."""
+        async with self.storage._db.execute(
+            "SELECT max_chat_id, thread_id, title FROM topics ORDER BY thread_id"
+        ) as cur:
+            rows = await cur.fetchall()
+        if not rows:
+            await message.reply("Нет подключённых чатов.")
+            return
+        buttons = []
+        for max_chat_id, thread_id, title in rows:
+            chat = await self._get_chat(max_chat_id)
+            chat_type = str(getattr(chat, "type", "") or "").upper()
+            if chat_type == "DIALOG":
+                continue
+            label = title or await self._chat_title_by_id(max_chat_id)
+            type_icon = "📢" if chat_type == "CHANNEL" else "👥"
+            buttons.append([InlineKeyboardButton(
+                text=f"{type_icon} {label}",
+                callback_data=f"acc:leave_pick:{self.account_id}:{max_chat_id}",
+            )])
+        if not buttons:
+            await message.reply("Нет групп или каналов для выхода (только личные чаты).")
+            return
+        await message.reply(
+            "Из какого чата выйти?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+
     async def confirm_leave(self, message: TgMessage, manager: "Manager") -> None:
         """Показывает подтверждение выхода из MAX-канала/группы."""
         thread = message.message_thread_id
         if thread is None:
-            await message.reply("Команду /leave отправь внутри нужной темы.")
+            # В General — показываем список групп/каналов кнопками
+            await self._leave_picker(message, manager)
             return
         max_chat_id = await self.storage.chat_by_thread(thread)
         if max_chat_id is None:
@@ -1633,9 +1678,17 @@ class Account:
         if not ids:
             await message.reply("Заглушённых чатов нет.")
             return
-        titles = [await self._chat_title_by_id(cid) for cid in ids]
+        rows = []
+        for cid in ids:
+            title = await self._chat_title_by_id(cid)
+            thread = await self.storage.get_topic(cid)
+            rows.append([InlineKeyboardButton(
+                text=f"🔔 Включить «{title}»",
+                callback_data=f"acc:unmute:{self.account_id}:{cid}",
+            )])
         await message.reply(
-            "🔕 Заглушённые чаты:\n" + "\n".join(f"• {t}" for t in titles)
+            "🔕 Заглушённые чаты:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
         )
 
     async def _send_to_max(self, message: TgMessage) -> None:
@@ -1952,6 +2005,46 @@ class Manager:
                         pass
             await self.registry.remove(account_id)
 
+    # ── Вспомогательные методы для кнопок ────────────────────────────────
+
+    async def _send_accounts_list(
+        self, tg: int, dest: TgMessage | None = None, *, cb: "CallbackQuery | None" = None
+    ) -> None:
+        accs = await self.registry.list_by_owner(tg)
+        if not accs:
+            text = "У тебя пока нет аккаунтов."
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="➕ Добавить аккаунт", callback_data="btn:add"),
+            ]])
+            if cb:
+                await cb.message.edit_text(text, reply_markup=kb)
+            else:
+                await dest.answer(text, reply_markup=kb)
+            return
+        rows = []
+        lines = []
+        for a in accs:
+            grp = "✅" if a["group_id"] else "⚠️ нет группы"
+            online = "🟢" if a["id"] in self.workers else "⚪️"
+            lines.append(f"{online} #{a['id']} «{a['name']}» {a['phone']} — {grp}")
+            rows.append([
+                InlineKeyboardButton(
+                    text=f"🗑 Удалить #{a['id']}",
+                    callback_data=f"btn:remove:{a['id']}",
+                ),
+                InlineKeyboardButton(
+                    text=f"🔄 Перелогин #{a['id']}",
+                    callback_data=f"btn:relogin:{a['id']}",
+                ),
+            ])
+        rows.append([InlineKeyboardButton(text="➕ Добавить аккаунт", callback_data="btn:add")])
+        text = "Твои аккаунты:\n" + "\n".join(lines)
+        kb = InlineKeyboardMarkup(inline_keyboard=rows)
+        if cb:
+            await cb.message.edit_text(text, reply_markup=kb)
+        else:
+            await dest.answer(text, reply_markup=kb)
+
     # ── Telegram-хендлеры ─────────────────────────────────────────────────
 
     def _register_handlers(self) -> None:
@@ -1959,15 +2052,17 @@ class Manager:
 
         @dp.message(Command("start", "help"))
         async def cmd_start(message: TgMessage) -> None:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="➕ Добавить аккаунт", callback_data="btn:add"),
+                    InlineKeyboardButton(text="📋 Мои аккаунты", callback_data="btn:accounts"),
+                ],
+            ])
             await message.answer(
                 "Привет! Я зеркалю переписку MAX в Telegram.\n\n"
-                "/add — добавить MAX-аккаунт (спрошу телефон и код из SMS)\n"
-                "/accounts — твои аккаунты\n"
-                "/remove N — удалить аккаунт\n"
-                "/setproxy N <url> — задать прокси (или off — убрать)\n"
-                "/relogin N — повторить вход (после прокси / сброса сессии)\n\n"
-                "У каждого аккаунта — своя группа-форум: после /add создаёшь "
-                "группу, добавляешь меня админом и пишешь там /bind."
+                "У каждого аккаунта — своя группа-форум: после добавления "
+                "создаёшь группу, добавляешь меня админом и пишешь там /bind.",
+                reply_markup=kb,
             )
 
         @dp.message(Command("setproxy"))
@@ -2058,21 +2153,7 @@ class Manager:
 
         @dp.message(Command("accounts"))
         async def cmd_accounts(message: TgMessage) -> None:
-            accs = await self.registry.list_by_owner(message.from_user.id)
-            if not accs:
-                await message.answer("У тебя пока нет аккаунтов. Добавь: /add")
-                return
-            lines = []
-            for a in accs:
-                grp = "✅ группа" if a["group_id"] else "⚠️ нет группы"
-                online = "🟢" if a["id"] in self.workers else "⚪️"
-                lines.append(
-                    f"{online} #{a['id']} «{a['name']}» {a['phone']} — {grp}"
-                )
-            await message.answer(
-                "Твои аккаунты:\n" + "\n".join(lines)
-                + "\n\nУдалить: /remove N"
-            )
+            await self._send_accounts_list(message.from_user.id, message)
 
         @dp.message(Command("remove"))
         async def cmd_remove(message: TgMessage, command: CommandObject) -> None:
@@ -2083,11 +2164,16 @@ class Manager:
                 await message.reply("У тебя нет аккаунтов. Добавить: /add")
                 return
             if not arg.isdigit():
-                lines = "\n".join(
-                    f"• #{a['id']} «{a['name']}» {a['phone']}" for a in accs
-                )
+                rows = [
+                    [InlineKeyboardButton(
+                        text=f"🗑 #{a['id']} «{a['name']}» {a['phone']}",
+                        callback_data=f"btn:remove:{a['id']}",
+                    )]
+                    for a in accs
+                ]
                 await message.reply(
-                    "Укажи номер аккаунта: /remove N\n\n" + lines
+                    "Выбери аккаунт для удаления:",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
                 )
                 return
             account_id = int(arg)
@@ -2300,6 +2386,12 @@ class Manager:
                 await self._handle_join(cb)
             elif data.startswith("leavechat_ok:") or data.startswith("leavechat_cancel:"):
                 await self._handle_leave(cb)
+            elif data.startswith("btn:"):
+                await self._handle_btn(cb)
+            elif data.startswith("adm:"):
+                await self._handle_adm(cb)
+            elif data.startswith("acc:"):
+                await self._handle_acc(cb)
             else:
                 await cb.answer()
 
@@ -2366,15 +2458,22 @@ class Manager:
         for a in accs:
             status[a["status"]] = status.get(a["status"], 0) + 1
         st = ", ".join(f"{k}: {v}" for k, v in sorted(status.items())) or "—"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📋 Все аккаунты", callback_data="adm:list"),
+                InlineKeyboardButton(text="🚫 Забаненные", callback_data="adm:banned"),
+            ],
+            [
+                InlineKeyboardButton(text="📦 Бэкап", callback_data="adm:backup"),
+            ],
+        ])
         await message.answer(
             "👑 Админ-панель\n"
             f"Пользователей: {users}\n"
             f"Аккаунтов: {len(accs)} (🟢 онлайн {online})\n"
             f"Статусы: {st}\n"
-            f"Забанено: {len(bans)}\n\n"
-            "Подробно: /admin list | /admin user <tg_id>\n"
-            "Управление: /admin stop N | start N | remove N\n"
-            "Доступ: /ban <tg_id> | /unban <tg_id> | /banned"
+            f"Забанено: {len(bans)}",
+            reply_markup=kb,
         )
 
     async def _admin_list(self, message: TgMessage, owner: int | None = None) -> None:
@@ -2384,16 +2483,27 @@ class Manager:
         if not accs:
             await message.answer("Аккаунтов нет.")
             return
-        lines = []
-        for a in accs[:60]:
+        # Шлём по одному сообщению с кнопками на каждые несколько аккаунтов.
+        for a in accs[:30]:
             dot = "🟢" if a["id"] in self.workers else "⚪️"
             grp = "✅" if a["group_id"] else "⚠️"
-            lines.append(
-                f"{dot} #{a['id']} «{a['name']}» {self._mask_phone(a['phone'])} "
-                f"— owner {a['owner_tg_id']} — {grp} — {a['status']}"
+            is_online = a["id"] in self.workers
+            aid = a["id"]
+            row1 = [
+                InlineKeyboardButton(
+                    text="⏹ Стоп" if is_online else "▶️ Старт",
+                    callback_data=f"adm:{'stop' if is_online else 'start'}:{aid}",
+                ),
+                InlineKeyboardButton(text="🗑 Удалить", callback_data=f"adm:remove:{aid}"),
+            ]
+            kb = InlineKeyboardMarkup(inline_keyboard=[row1])
+            await message.answer(
+                f"{dot} #{aid} «{a['name']}» {self._mask_phone(a['phone'])} "
+                f"— {grp} — {a['status']}\nOwner: {a['owner_tg_id']}",
+                reply_markup=kb,
             )
-        extra = f"\n… и ещё {len(accs) - 60}" if len(accs) > 60 else ""
-        await message.answer("\n".join(lines) + extra)
+        if len(accs) > 30:
+            await message.answer(f"… и ещё {len(accs) - 30} аккаунтов")
 
     async def _admin_action(
         self, message: TgMessage, action: str, account_id: int
@@ -2701,6 +2811,191 @@ class Manager:
             "[%s] Вступил в %s «%s» по ссылке %s",
             worker.name, type_label, joined_title, link,
         )
+
+    async def _handle_btn(self, cb: CallbackQuery) -> None:
+        """Кнопки в личке: btn:add, btn:accounts, btn:remove:N, btn:relogin:N."""
+        parts = (cb.data or "").split(":")
+        tg = cb.from_user.id
+        action = parts[1] if len(parts) > 1 else ""
+
+        if action == "add":
+            await cb.answer()
+            if await self.registry.is_banned(tg):
+                await cb.message.answer("🚫 Доступ к боту ограничен.")
+                return
+            reason = await self._check_add_quota(tg)
+            if reason:
+                await cb.message.answer(reason)
+                return
+            self.conv[tg] = Conv(step="phone")
+            await cb.message.answer(
+                "Пришли номер телефона MAX в международном формате, например +79991234567"
+            )
+
+        elif action == "accounts":
+            await cb.answer()
+            await self._send_accounts_list(tg, cb=cb)
+
+        elif action == "remove" and len(parts) > 2 and parts[2].isdigit():
+            account_id = int(parts[2])
+            acc = await self.registry.get(account_id)
+            if acc is None or acc["owner_tg_id"] != tg:
+                await cb.answer("Нет такого аккаунта.", show_alert=True)
+                return
+            name = acc["name"]
+            await cb.answer(f"Удаляю «{name}»…")
+            await self._cleanup_account(account_id, delete=True)
+            try:
+                await cb.message.edit_text(
+                    f"🗑 Аккаунт #{account_id} «{name}» удалён.",
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            await self._send_accounts_list(tg, cb=cb)
+
+        elif action == "relogin" and len(parts) > 2 and parts[2].isdigit():
+            account_id = int(parts[2])
+            acc = await self.registry.get(account_id)
+            if acc is None or acc["owner_tg_id"] != tg:
+                await cb.answer("Нет такого аккаунта.", show_alert=True)
+                return
+            wait = self._cmd_cooldown(tg, "restart", 15)
+            if wait:
+                await cb.answer(f"Слишком часто. Подожди {wait} сек.", show_alert=True)
+                return
+            await cb.answer("Перезапускаю…")
+            await self._restart_account(account_id, announce=True)
+
+        else:
+            await cb.answer()
+
+    async def _handle_adm(self, cb: CallbackQuery) -> None:
+        """Кнопки админ-панели: adm:list, adm:banned, adm:backup, adm:stop:N, adm:start:N, adm:remove:N."""
+        if cb.from_user.id not in self.admin_ids:
+            await cb.answer("Нет доступа.", show_alert=True)
+            return
+        parts = (cb.data or "").split(":")
+        action = parts[1] if len(parts) > 1 else ""
+
+        if action == "list":
+            await cb.answer()
+            await self._admin_list(cb.message)
+
+        elif action == "banned":
+            await cb.answer()
+            ids = await self.registry.list_bans()
+            if not ids:
+                await cb.message.answer("Забаненных нет.")
+            else:
+                await cb.message.answer("🚫 Забанены:\n" + "\n".join(str(i) for i in ids))
+
+        elif action == "backup":
+            await cb.answer("Делаю бэкап…")
+            await cb.message.answer("📦 Делаю бэкап…")
+            try:
+                path = await self._backup_now()
+            except Exception as e:
+                await cb.message.answer(f"❌ Бэкап не удался: {e}")
+                return
+            size = os.path.getsize(path)
+            if size <= TG_UPLOAD_LIMIT:
+                await cb.message.answer_document(
+                    FSInputFile(path), caption=f"📦 Бэкап ({size // 1024} КБ)"
+                )
+            else:
+                await cb.message.answer(
+                    f"✅ Бэкап на сервере:\n{path}\n({size // 1024 // 1024} МБ)"
+                )
+
+        elif action in ("stop", "start", "remove") and len(parts) > 2 and parts[2].isdigit():
+            account_id = int(parts[2])
+            await cb.answer(f"{action} #{account_id}…")
+            await self._admin_action(cb.message, action, account_id)
+
+        else:
+            await cb.answer()
+
+    async def _handle_acc(self, cb: CallbackQuery) -> None:
+        """Кнопки в группе аккаунта: acc:mute/unmute/leave_pick:ACCID:CHATID."""
+        parts = (cb.data or "").split(":")
+        if len(parts) < 4:
+            await cb.answer()
+            return
+        action = parts[1]
+        account_id = int(parts[2]) if parts[2].isdigit() else None
+        max_chat_id = int(parts[3]) if parts[3].isdigit() else None
+        if account_id is None or max_chat_id is None:
+            await cb.answer()
+            return
+
+        worker = self.workers.get(account_id)
+        if worker is None or cb.from_user.id != worker.owner_tg_id:
+            await cb.answer("Нет доступа.", show_alert=True)
+            return
+
+        if action == "leave_pick":
+            # Показываем подтверждение выхода из выбранного чата
+            await cb.answer()
+            title = await worker._chat_title_by_id(max_chat_id)
+            chat = await worker._get_chat(max_chat_id)
+            chat_type = str(getattr(chat, "type", "") or "").upper()
+            type_label = "канал" if chat_type == "CHANNEL" else "группа"
+
+            self._req_counter += 1
+            req_id = self._req_counter
+            thread_id = await worker.storage.get_topic(max_chat_id)
+            self.pending_leaves[req_id] = {
+                "account_id": account_id,
+                "max_chat_id": max_chat_id,
+                "thread_id": thread_id,
+                "title": title,
+                "chat_type": chat_type,
+            }
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text=f"✅ Выйти из «{title}»",
+                    callback_data=f"leavechat_ok:{req_id}",
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отмена",
+                    callback_data=f"leavechat_cancel:{req_id}",
+                ),
+            ]])
+            try:
+                await cb.message.edit_text(
+                    f"⚠️ Выйти из {type_label}а «{title}»?\n\n"
+                    "Тема в Telegram будет закрыта, история останется.",
+                    reply_markup=kb,
+                )
+            except Exception:
+                pass
+            return
+
+        muted = action == "mute"
+        await worker.storage.set_muted(max_chat_id, muted)
+        title = await worker._chat_title_by_id(max_chat_id)
+        if muted:
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="🔔 Включить уведомления",
+                    callback_data=f"acc:unmute:{account_id}:{max_chat_id}",
+                )
+            ]])
+            text = f"🔕 Чат «{title}» — без звука."
+        else:
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="🔕 Заглушить",
+                    callback_data=f"acc:mute:{account_id}:{max_chat_id}",
+                )
+            ]])
+            text = f"🔔 Чат «{title}» — со звуком."
+        await cb.answer()
+        try:
+            await cb.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            await cb.message.answer(text, reply_markup=kb)
 
     async def _handle_approval(self, cb: CallbackQuery) -> None:
         if cb.from_user.id not in self.admin_ids:
