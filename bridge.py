@@ -2473,8 +2473,7 @@ class Manager:
                     await self._on_phone(message)
                     return
                 if (
-                    conv.step in ("code", "password")
-                    and conv.future is not None
+                    conv.future is not None
                     and not conv.future.done()
                 ):
                     conv.future.set_result((message.text or "").strip())
@@ -2611,13 +2610,18 @@ class Manager:
             if archive_path.endswith(".enc"):
                 passphrase = self.config.backup_passphrase
                 if not passphrase:
-                    await message.answer(
-                        "❌ Файл зашифрован, но BACKUP_PASSPHRASE не задан в .env"
+                    # Запрашиваем пароль у администратора прямо в чате
+                    passphrase = await self.await_input(
+                        message.chat.id, "restore_pass",
+                        "🔐 Файл зашифрован. Введи пароль (BACKUP_PASSPHRASE):",
                     )
+                try:
+                    archive_path = await asyncio.to_thread(
+                        _decrypt_file, archive_path, passphrase
+                    )
+                except Exception:
+                    await message.answer("❌ Неверный пароль — не удалось расшифровать.")
                     return
-                archive_path = await asyncio.to_thread(
-                    _decrypt_file, archive_path, passphrase
-                )
 
             # Делаем автобэкап текущего состояния перед перезаписью
             await message.answer("💾 Делаю бэкап текущего состояния на всякий случай…")
