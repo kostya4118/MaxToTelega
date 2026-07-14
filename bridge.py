@@ -1384,54 +1384,30 @@ class Account:
 
     async def _get_user_avatar(self, user, chat_id: int) -> bytes | None:
         """Пробует получить аватар пользователя MAX. Возвращает байты или None."""
-        # Диагностика: логируем все поля user и chat
+        # Прямые URL-поля на объекте User
         if user is not None:
-            u_attrs = {a: str(getattr(user, a, None))[:120]
-                       for a in dir(user) if not a.startswith("_")}
-            logger.warning("[avatar] user fields: %s", u_attrs)
-        try:
-            chat = await self._get_chat(chat_id)
-            if chat is not None:
-                c_attrs = {a: str(getattr(chat, a, None))[:120]
-                           for a in dir(chat) if not a.startswith("_")}
-                logger.warning("[avatar] chat fields: %s", c_attrs)
-            else:
-                logger.warning("[avatar] chat is None for chat_id=%s", chat_id)
-        except Exception:
-            logger.warning("_get_user_avatar: ошибка получения чата", exc_info=True)
-            chat = None
-
-        # Вариант 1: у user есть поле с фото
-        for attr in ("avatar", "photo", "icon", "image"):
-            obj = getattr(user, attr, None)
-            if obj is None:
-                continue
-            for url_attr in ("url", "base_url", "photo_url"):
-                url = getattr(obj, url_attr, None)
-                if url:
+            for url in (
+                getattr(user, "base_url", None),
+                getattr(user, "base_raw_url", None),
+            ):
+                if url and isinstance(url, str) and url.startswith("http"):
                     data = await self._download(url)
                     if data:
                         return data
-            if isinstance(obj, str) and obj.startswith("http"):
-                data = await self._download(obj)
-                if data:
-                    return data
-        # Вариант 2: через чат диалога
-        if chat is not None:
-            for attr in ("icon", "photo", "avatar", "image"):
-                obj = getattr(chat, attr, None)
-                if obj is None:
-                    continue
-                for url_attr in ("url", "base_url", "photo_url"):
-                    url = getattr(obj, url_attr, None)
-                    if url:
+        # URL аватара из объекта Chat
+        try:
+            chat = await self._get_chat(chat_id)
+            if chat is not None:
+                for url in (
+                    getattr(chat, "base_icon_url", None),
+                    getattr(chat, "base_raw_icon_url", None),
+                ):
+                    if url and isinstance(url, str) and url.startswith("http"):
                         data = await self._download(url)
                         if data:
                             return data
-                if isinstance(obj, str) and obj.startswith("http"):
-                    data = await self._download(obj)
-                    if data:
-                        return data
+        except Exception:
+            logger.debug("_get_user_avatar: ошибка получения чата", exc_info=True)
         return None
 
     async def _handle_invite_link(self, message: TgMessage, link: str) -> None:
