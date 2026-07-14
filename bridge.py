@@ -1353,16 +1353,24 @@ class Account:
             "name": name,
             "send_text": send_text,
         }
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text=f"✅ Отправить «{send_text}»",
-                callback_data=f"newchat_ok:{req_id}",
-            ),
-            InlineKeyboardButton(
-                text="❌ Отмена",
-                callback_data=f"newchat_cancel:{req_id}",
-            ),
-        ]])
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"✅ Отправить «{send_text}»",
+                    callback_data=f"newchat_ok:{req_id}",
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отмена",
+                    callback_data=f"newchat_cancel:{req_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👤 Профиль",
+                    callback_data=f"acc:profile:{self.account_id}:{user_id}",
+                ),
+            ],
+        ])
         caption = (
             f"👤 Найден: «{name}» (MAX ID {user_id})\n\n"
             f"Первое сообщение: «{send_text}»\n\n"
