@@ -1388,15 +1388,17 @@ class Account:
         if user is not None:
             u_attrs = {a: str(getattr(user, a, None))[:120]
                        for a in dir(user) if not a.startswith("_")}
-            logger.info("[avatar] user fields: %s", u_attrs)
+            logger.warning("[avatar] user fields: %s", u_attrs)
         try:
             chat = await self._get_chat(chat_id)
             if chat is not None:
                 c_attrs = {a: str(getattr(chat, a, None))[:120]
                            for a in dir(chat) if not a.startswith("_")}
-                logger.info("[avatar] chat fields: %s", c_attrs)
+                logger.warning("[avatar] chat fields: %s", c_attrs)
+            else:
+                logger.warning("[avatar] chat is None for chat_id=%s", chat_id)
         except Exception:
-            logger.debug("_get_user_avatar: ошибка получения чата", exc_info=True)
+            logger.warning("_get_user_avatar: ошибка получения чата", exc_info=True)
             chat = None
 
         # Вариант 1: у user есть поле с фото
