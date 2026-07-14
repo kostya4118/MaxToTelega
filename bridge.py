@@ -1384,6 +1384,21 @@ class Account:
 
     async def _get_user_avatar(self, user, chat_id: int) -> bytes | None:
         """Пробует получить аватар пользователя MAX. Возвращает байты или None."""
+        # Диагностика: логируем все поля user и chat
+        if user is not None:
+            u_attrs = {a: str(getattr(user, a, None))[:120]
+                       for a in dir(user) if not a.startswith("_")}
+            logger.info("[avatar] user fields: %s", u_attrs)
+        try:
+            chat = await self._get_chat(chat_id)
+            if chat is not None:
+                c_attrs = {a: str(getattr(chat, a, None))[:120]
+                           for a in dir(chat) if not a.startswith("_")}
+                logger.info("[avatar] chat fields: %s", c_attrs)
+        except Exception:
+            logger.debug("_get_user_avatar: ошибка получения чата", exc_info=True)
+            chat = None
+
         # Вариант 1: у user есть поле с фото
         for attr in ("avatar", "photo", "icon", "image"):
             obj = getattr(user, attr, None)
@@ -1395,14 +1410,12 @@ class Account:
                     data = await self._download(url)
                     if data:
                         return data
-            # Если сам объект — строка-URL
             if isinstance(obj, str) and obj.startswith("http"):
                 data = await self._download(obj)
                 if data:
                     return data
         # Вариант 2: через чат диалога
-        try:
-            chat = await self._get_chat(chat_id)
+        if chat is not None:
             for attr in ("icon", "photo", "avatar", "image"):
                 obj = getattr(chat, attr, None)
                 if obj is None:
@@ -1417,8 +1430,6 @@ class Account:
                     data = await self._download(obj)
                     if data:
                         return data
-        except Exception:
-            logger.debug("_get_user_avatar: ошибка получения чата", exc_info=True)
         return None
 
     async def _handle_invite_link(self, message: TgMessage, link: str) -> None:
