@@ -1410,6 +1410,69 @@ class Account:
             logger.debug("_get_user_avatar: ошибка получения чата", exc_info=True)
         return None
 
+    async def show_profile(self, message: TgMessage) -> None:
+        """Показывает профиль собеседника в текущей теме."""
+        thread = message.message_thread_id
+        if thread is None:
+            await message.reply("Команду /profile отправь внутри нужной темы.")
+            return
+        max_chat_id = await self.storage.chat_by_thread(thread)
+        if max_chat_id is None:
+            await message.reply("Не могу определить чат MAX для этой темы.")
+            return
+
+        my_id = self._my_id()
+        chat = await self._get_chat(max_chat_id)
+        chat_type = str(getattr(chat, "type", "") or "").upper()
+
+        if chat_type in ("CHANNEL", "GROUP"):
+            # Для канала/группы показываем инфо о чате
+            title = getattr(chat, "title", None) or await self._chat_title_by_id(max_chat_id)
+            members = getattr(chat, "members_count", None) or getattr(chat, "participants_count", None)
+            desc = getattr(chat, "description", None)
+            link = getattr(chat, "link", None)
+            lines = [f"{'📢' if chat_type == 'CHANNEL' else '👥'} <b>{title}</b>"]
+            if members:
+                lines.append(f"👤 Участников: {members}")
+            if desc:
+                lines.append(f"\n{desc}")
+            if link:
+                lines.append(f"\n🔗 {link}")
+            avatar = await self._get_user_avatar(None, max_chat_id)
+        else:
+            # Диалог — получаем профиль собеседника
+            if my_id is None:
+                await message.reply("⚠️ Аккаунт MAX ещё не готов.")
+                return
+            other_id = max_chat_id ^ my_id
+            try:
+                user = await self.client.get_user(other_id)
+            except Exception:
+                user = None
+            name = self._label_for(user, other_id) if user else f"ID {other_id}"
+            lines = [f"👤 <b>{name}</b>"]
+            if user:
+                link = getattr(user, "link", None)
+                if link:
+                    lines.append(f"🔗 @{link}" if "/" not in link else f"🔗 {link}")
+                phone = getattr(user, "phone", None)
+                if phone:
+                    lines.append(f"📞 +{phone}")
+                desc = getattr(user, "description", None)
+                if desc:
+                    lines.append(f"\n{desc}")
+            avatar = await self._get_user_avatar(user if user else None, max_chat_id)
+
+        text = "\n".join(lines)
+        if avatar:
+            await message.answer_photo(
+                BufferedInputFile(avatar, filename="avatar.jpg"),
+                caption=text,
+                parse_mode="HTML",
+            )
+        else:
+            await message.answer(text, parse_mode="HTML")
+
     async def _handle_invite_link(self, message: TgMessage, link: str) -> None:
         """Обработка ссылки-приглашения MAX в General-теме."""
         hint = await message.reply("🔍 Получаю информацию о канале/группе…")
@@ -1664,16 +1727,24 @@ class Account:
             "name": name,
             "send_text": "👋",
         }
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text=f"✅ Написать «{name}»",
-                callback_data=f"newchat_ok:{req_id}",
-            ),
-            InlineKeyboardButton(
-                text="❌ Отмена",
-                callback_data=f"newchat_cancel:{req_id}",
-            ),
-        ]])
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"✅ Написать «{name}»",
+                    callback_data=f"newchat_ok:{req_id}",
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отмена",
+                    callback_data=f"newchat_cancel:{req_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👤 Профиль",
+                    callback_data=f"acc:profile:{self.account_id}:{sender_id}",
+                ),
+            ],
+        ])
         caption = f"👤 Открыть личный чат с «{name}»?"
         avatar = await self._get_user_avatar(user, dm_chat_id)
         if avatar:
@@ -2339,6 +2410,10 @@ class Manager:
                 "приходить сюда отдельными темами."
             )
 
+        @dp.message(Command("profile"))
+        async def cmd_profile(message: TgMessage) -> None:
+            await self._route_command(message, "profile")
+
         @dp.message(Command("dm"))
         async def cmd_dm(message: TgMessage) -> None:
             await self._route_command(message, "dm")
@@ -2563,7 +2638,9 @@ class Manager:
         if worker is None or message.from_user.id != worker.owner_tg_id:
             await message.reply("Эта команда работает в группе твоего аккаунта.")
             return
-        if cmd == "dm":
+        if cmd == "profile":
+            await worker.show_profile(message)
+        elif cmd == "dm":
             await worker.cmd_dm(message, self)
         elif cmd == "leave":
             await worker.confirm_leave(message, self)
@@ -3167,6 +3244,39 @@ class Manager:
         worker = self.workers.get(account_id)
         if worker is None or cb.from_user.id != worker.owner_tg_id:
             await cb.answer("Нет доступа.", show_alert=True)
+            return
+
+        if action == "profile":
+            # max_chat_id здесь — это user_id собеседника
+            user_id = max_chat_id
+            await cb.answer()
+            try:
+                user = await worker.client.get_user(user_id)
+            except Exception:
+                user = None
+            name = worker._label_for(user, user_id) if user else f"ID {user_id}"
+            my_id = worker._my_id()
+            chat_id = (my_id ^ user_id) if my_id else user_id
+            lines = [f"👤 <b>{name}</b>"]
+            if user:
+                link = getattr(user, "link", None)
+                if link:
+                    lines.append(f"🔗 @{link}" if "/" not in link else f"🔗 {link}")
+                phone = getattr(user, "phone", None)
+                if phone:
+                    lines.append(f"📞 +{phone}")
+                desc = getattr(user, "description", None)
+                if desc:
+                    lines.append(f"\n{desc}")
+            text = "\n".join(lines)
+            avatar = await worker._get_user_avatar(user, chat_id)
+            if avatar:
+                await cb.message.answer_photo(
+                    BufferedInputFile(avatar, filename="avatar.jpg"),
+                    caption=text, parse_mode="HTML",
+                )
+            else:
+                await cb.message.answer(text, parse_mode="HTML")
             return
 
         if action == "leave_pick":
