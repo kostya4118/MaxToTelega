@@ -1674,10 +1674,20 @@ class Account:
                 callback_data=f"newchat_cancel:{req_id}",
             ),
         ]])
-        await hint.edit_text(
-            f"👤 Открыть личный чат с «{name}»?",
-            reply_markup=kb,
-        )
+        caption = f"👤 Открыть личный чат с «{name}»?"
+        avatar = await self._get_user_avatar(user, dm_chat_id)
+        if avatar:
+            try:
+                await hint.delete()
+            except Exception:
+                pass
+            await message.answer_photo(
+                BufferedInputFile(avatar, filename="avatar.jpg"),
+                caption=caption,
+                reply_markup=kb,
+            )
+        else:
+            await hint.edit_text(caption, reply_markup=kb)
 
     async def _leave_picker(self, message: TgMessage, manager: "Manager") -> None:
         """Список групп/каналов MAX для выбора через кнопки (вызов /leave из General)."""
