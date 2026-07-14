@@ -1363,12 +1363,63 @@ class Account:
                 callback_data=f"newchat_cancel:{req_id}",
             ),
         ]])
-        await hint.edit_text(
+        caption = (
             f"👤 Найден: «{name}» (MAX ID {user_id})\n\n"
             f"Первое сообщение: «{send_text}»\n\n"
-            "Начать чат?",
-            reply_markup=kb,
+            "Начать чат?"
         )
+        avatar = await self._get_user_avatar(user, max_chat_id)
+        if avatar:
+            try:
+                await hint.delete()
+            except Exception:
+                pass
+            await message.answer_photo(
+                BufferedInputFile(avatar, filename="avatar.jpg"),
+                caption=caption,
+                reply_markup=kb,
+            )
+        else:
+            await hint.edit_text(caption, reply_markup=kb)
+
+    async def _get_user_avatar(self, user, chat_id: int) -> bytes | None:
+        """Пробует получить аватар пользователя MAX. Возвращает байты или None."""
+        # Вариант 1: у user есть поле с фото
+        for attr in ("avatar", "photo", "icon", "image"):
+            obj = getattr(user, attr, None)
+            if obj is None:
+                continue
+            for url_attr in ("url", "base_url", "photo_url"):
+                url = getattr(obj, url_attr, None)
+                if url:
+                    data = await self._download(url)
+                    if data:
+                        return data
+            # Если сам объект — строка-URL
+            if isinstance(obj, str) and obj.startswith("http"):
+                data = await self._download(obj)
+                if data:
+                    return data
+        # Вариант 2: через чат диалога
+        try:
+            chat = await self._get_chat(chat_id)
+            for attr in ("icon", "photo", "avatar", "image"):
+                obj = getattr(chat, attr, None)
+                if obj is None:
+                    continue
+                for url_attr in ("url", "base_url", "photo_url"):
+                    url = getattr(obj, url_attr, None)
+                    if url:
+                        data = await self._download(url)
+                        if data:
+                            return data
+                if isinstance(obj, str) and obj.startswith("http"):
+                    data = await self._download(obj)
+                    if data:
+                        return data
+        except Exception:
+            logger.debug("_get_user_avatar: ошибка получения чата", exc_info=True)
+        return None
 
     async def _handle_invite_link(self, message: TgMessage, link: str) -> None:
         """Обработка ссылки-приглашения MAX в General-теме."""
