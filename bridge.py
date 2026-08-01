@@ -1562,23 +1562,29 @@ class Account:
                 except Exception:
                     pass
 
-                # Кэш не помог — пробуем resolve с одним username (без домена).
+                # Кэш не помог — пробуем join_channel: оно отправляет ссылку
+                # как есть в CHAT_JOIN и может вернуть DIALOG-чат для бота.
                 if user is None:
                     try:
-                        resolved = await self.client.resolve_group_by_link(username)
-                        if resolved is not None:
-                            rtype = str(getattr(resolved, "type", "")).upper()
+                        joined = await self.client.join_channel(link)
+                        if joined is not None:
+                            rtype = str(getattr(joined, "type", "")).upper()
                             if rtype == "DIALOG":
-                                # это пользователь/бот-объект
-                                uid = getattr(resolved, "id", None)
-                                if uid:
-                                    user = resolved
-                                    # нормализуем как user-объект
+                                # DIALOG — это бот/пользователь; вычисляем его ID
+                                bot_id = getattr(joined, "id", None)
+                                if bot_id is not None:
+                                    bot_id = bot_id ^ my_id
+                                    user = await self.client.get_user(bot_id)
+                                    if user is None:
+                                        # создаём минимальный объект-заглушку
+                                        class _BotStub:
+                                            id = bot_id
+                                            is_bot = True
+                                        user = _BotStub()
                             elif rtype in ("CHANNEL", "GROUP"):
-                                # resolve вернул группу с коротким именем — всё-таки группа
-                                chat = resolved
-                    except Exception:
-                        pass
+                                chat = joined
+                    except Exception as e:
+                        logger.debug("join_channel(%s) не помог: %s", link, e)
 
             if user is not None:
                 user_id: int = getattr(user, "id", None) or getattr(user, "contact", user).id
