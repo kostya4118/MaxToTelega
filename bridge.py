@@ -378,6 +378,9 @@ class Account:
         self._last_chat_reaction: tuple | None = None
         self._diag_attaches: set[str] = set()
         self._diag_kb = False
+        # Клавиатуры, висящие на сообщениях TG: (chat_id, msg_id) -> markup.
+        # Нужны, чтобы правка сообщения не сбрасывала кнопки.
+        self._kb_cache: dict[tuple[int, int], InlineKeyboardMarkup] = {}
         # Темы, созданные только что: Telegram авто-закрепляет первое
         # сообщение — снимем его после отправки.
         self._fresh_topics: set[int] = set()
@@ -601,13 +604,21 @@ class Account:
             parts.append(message.text)
         new_body = "\n".join(parts)
 
+        # Telegram сбрасывает клавиатуру, если её не передать при правке.
+        # Боты MAX часто дописывают сообщение, поэтому кнопки надо вернуть:
+        # берём новые из правки, иначе — те, что уже висят на сообщении.
+        new_kb = self._kb_from_max(message)
+
         for tg_chat, tg_msg, role in rows:
+            kb = new_kb or self._kb_cache.get((tg_chat, tg_msg))
             if role == "text":
                 try:
                     await self.bot.edit_message_text(
                         new_body or "📭 (пусто)",
                         chat_id=tg_chat, message_id=tg_msg,
+                        reply_markup=kb,
                     )
+                    self._remember_kb(tg_chat, tg_msg, kb)
                 except Exception:
                     logger.debug("edit_text не удался", exc_info=True)
                 return
@@ -616,7 +627,9 @@ class Account:
                     await self.bot.edit_message_caption(
                         chat_id=tg_chat, message_id=tg_msg,
                         caption=new_body or None,
+                        reply_markup=kb,
                     )
+                    self._remember_kb(tg_chat, tg_msg, kb)
                 except Exception:
                     logger.debug("edit_caption не удался", exc_info=True)
                 return
@@ -969,6 +982,7 @@ class Account:
                 await self.bot.edit_message_reply_markup(
                     chat_id=dest, message_id=records[0][0], reply_markup=kb,
                 )
+                self._remember_kb(dest, records[0][0], kb)
             except Exception:
                 logger.info("[%s] не прикрепить клавиатуру MAX",
                             self.name, exc_info=True)
@@ -1108,6 +1122,17 @@ class Account:
                 logger.exception("Не удалось обработать вложение из MAX")
                 notes.append("📎 вложение (ошибка обработки)")
         return result, notes, specials
+
+    def _remember_kb(
+        self, tg_chat: int, tg_msg: int, kb: InlineKeyboardMarkup | None
+    ) -> None:
+        if kb is None:
+            self._kb_cache.pop((tg_chat, tg_msg), None)
+            return
+        self._kb_cache[(tg_chat, tg_msg)] = kb
+        if len(self._kb_cache) > 2000:
+            for stale in list(self._kb_cache)[:500]:
+                self._kb_cache.pop(stale, None)
 
     def _kb_from_max(self, message: Message) -> InlineKeyboardMarkup | None:
         """Строит Telegram-клавиатуру из inline-кнопок бота MAX.
