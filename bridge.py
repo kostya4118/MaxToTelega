@@ -1213,6 +1213,40 @@ class Account:
                 return None
             return await resp.read()
 
+    async def _resolve_max_username(self, username: str) -> int | None:
+        """Резолвит username MAX (или бота) в числовой user ID через страницу профиля."""
+        import json as _json
+        url = f"https://max.ru/{username}"
+        try:
+            headers = {"User-Agent": "Mozilla/5.0 (compatible; MaxToTelega)"}
+            async with self.http.get(url, headers=headers, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    logger.debug("_resolve_max_username %s -> HTTP %s", username, resp.status)
+                    return None
+                html = await resp.text(errors="replace")
+        except Exception as e:
+            logger.debug("_resolve_max_username HTTP error: %s", e)
+            return None
+
+        # Ищем числовой ID в JSON-LD, meta или window.__INITIAL_STATE__
+        patterns = [
+            r'"userId"\s*:\s*(\d+)',
+            r'"user_id"\s*:\s*(\d+)',
+            r'"id"\s*:\s*(\d+)',
+            r'userId["\s:]+(\d{6,})',
+            r'"uin"\s*:\s*"?(\d+)"?',
+            r'content="max://user/(\d+)"',
+        ]
+        for pat in patterns:
+            m = re.search(pat, html)
+            if m:
+                uid = int(m.group(1))
+                logger.info("_resolve_max_username %s -> %d (pattern %s)", username, uid, pat)
+                return uid
+
+        logger.debug("_resolve_max_username %s: ID не найден в HTML", username)
+        return None
+
     # ── Telegram -> MAX ───────────────────────────────────────────────────
 
     async def handle_tg(self, message: TgMessage) -> None:
@@ -1658,6 +1692,19 @@ class Account:
                     logger.info("[%s] _find_max_user: нашли в кэше чатов uid=%s",
                                 self.name, uid)
                     return cached
+
+        # 4) Резолв username через страницу профиля max.ru.
+        if not is_phone and not raw_digits.isdigit():
+            uid = await self._resolve_max_username(q)
+            if uid is not None:
+                try:
+                    user = await self.client.get_user(uid)
+                    if user is not None:
+                        logger.info("[%s] _find_max_user: нашли через профиль max.ru uid=%s",
+                                    self.name, uid)
+                        return user
+                except Exception:
+                    logger.debug("get_user(%s) после resolve не удался", uid, exc_info=True)
 
         logger.info("[%s] _find_max_user: не нашли %r", self.name, query)
         return None
