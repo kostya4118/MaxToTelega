@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 import aiohttp
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
@@ -66,6 +66,7 @@ from pymax.types.domain import (
     VideoAttachment,
 )
 from pymax.types.domain.enums import ChatType
+from pymax.types import User as MaxUser
 
 from config import Config
 from registry import Registry
@@ -145,6 +146,10 @@ if _LOG_FILE:
 
 TG_CAPTION_LIMIT = 1024
 PHONE_RE = re.compile(r"^\+\d{7,15}$")
+# Опкоды внутреннего протокола MAX, которые PyMax не оборачивает.
+_OP_CONTACT_SEARCH = 37
+_OP_MSG_SEND_CALLBACK = 118
+
 MAX_LINK_RE = re.compile(
     r"https?://(?:[\w.-]*\.)?(?:max\.ru|oneme\.ru|o\.ru)/\S+",
     re.IGNORECASE,
@@ -372,6 +377,10 @@ class Account:
         self._seen_opcodes: set[int] = set()
         self._last_chat_reaction: tuple | None = None
         self._diag_attaches: set[str] = set()
+        self._diag_kb = False
+        # Клавиатуры, висящие на сообщениях TG: (chat_id, msg_id) -> markup.
+        # Нужны, чтобы правка сообщения не сбрасывала кнопки.
+        self._kb_cache: dict[tuple[int, int], InlineKeyboardMarkup] = {}
         # Темы, созданные только что: Telegram авто-закрепляет первое
         # сообщение — снимем его после отправки.
         self._fresh_topics: set[int] = set()
@@ -595,13 +604,21 @@ class Account:
             parts.append(message.text)
         new_body = "\n".join(parts)
 
+        # Telegram сбрасывает клавиатуру, если её не передать при правке.
+        # Боты MAX часто дописывают сообщение, поэтому кнопки надо вернуть:
+        # берём новые из правки, иначе — те, что уже висят на сообщении.
+        new_kb = self._kb_from_max(message)
+
         for tg_chat, tg_msg, role in rows:
+            kb = new_kb or self._kb_cache.get((tg_chat, tg_msg))
             if role == "text":
                 try:
                     await self.bot.edit_message_text(
                         new_body or "📭 (пусто)",
                         chat_id=tg_chat, message_id=tg_msg,
+                        reply_markup=kb,
                     )
+                    self._remember_kb(tg_chat, tg_msg, kb)
                 except Exception:
                     logger.debug("edit_text не удался", exc_info=True)
                 return
@@ -610,7 +627,9 @@ class Account:
                     await self.bot.edit_message_caption(
                         chat_id=tg_chat, message_id=tg_msg,
                         caption=new_body or None,
+                        reply_markup=kb,
                     )
+                    self._remember_kb(tg_chat, tg_msg, kb)
                 except Exception:
                     logger.debug("edit_caption не удался", exc_info=True)
                 return
@@ -956,6 +975,18 @@ class Account:
             )
             records.append((sent.message_id, "text"))
 
+        # Кнопки бота MAX вешаем на первое отправленное сообщение.
+        kb = self._kb_from_max(message)
+        if kb is not None and records:
+            try:
+                await self.bot.edit_message_reply_markup(
+                    chat_id=dest, message_id=records[0][0], reply_markup=kb,
+                )
+                self._remember_kb(dest, records[0][0], kb)
+            except Exception:
+                logger.info("[%s] не прикрепить клавиатуру MAX",
+                            self.name, exc_info=True)
+
         for mid, role in records:
             # Текст храним у несущей роли — чтобы потом дописать реакции.
             await self.storage.remember_msg(
@@ -1052,6 +1083,8 @@ class Account:
                     notes.append("📞 звонок")
                 elif isinstance(attach, ControlAttachment):
                     notes.append("ℹ️ системное сообщение")
+                elif isinstance(getattr(attach, "keyboard", None), dict):
+                    pass  # клавиатуру рисуем кнопками, а не текстом
                 else:
                     t = getattr(attach, "type", None)
                     type_name = (
@@ -1089,6 +1122,142 @@ class Account:
                 logger.exception("Не удалось обработать вложение из MAX")
                 notes.append("📎 вложение (ошибка обработки)")
         return result, notes, specials
+
+    def _remember_kb(
+        self, tg_chat: int, tg_msg: int, kb: InlineKeyboardMarkup | None
+    ) -> None:
+        if kb is None:
+            self._kb_cache.pop((tg_chat, tg_msg), None)
+            return
+        self._kb_cache[(tg_chat, tg_msg)] = kb
+        if len(self._kb_cache) > 2000:
+            for stale in list(self._kb_cache)[:500]:
+                self._kb_cache.pop(stale, None)
+
+    def _kb_from_max(self, message: Message) -> InlineKeyboardMarkup | None:
+        """Строит Telegram-клавиатуру из inline-кнопок бота MAX.
+
+        MAX отдаёт клавиатуру сырым dict-ом. Ожидаемая форма:
+        {"buttons": [[{"type": "CALLBACK", "text": "…", "payload": "…"}]]}
+        Полезная нагрузка кнопки длиннее 64 байт не влезает в callback_data
+        Telegram, поэтому храним её в памяти и передаём короткий id.
+        """
+        kbd = None
+        kb_attach = None
+        for attach in message.attaches:
+            candidate = getattr(attach, "keyboard", None)
+            if isinstance(candidate, dict):
+                kbd = candidate
+                kb_attach = attach
+                break
+        if not kbd:
+            return None
+
+        if not self._diag_kb:
+            # Сервер расшифровывает callbackId, значит он приходит готовым —
+            # ищем его в самом вложении и в сыром сообщении.
+            self._diag_kb = True
+            try:
+                dump = kb_attach.model_dump()
+            except Exception:
+                dump = {"repr": repr(kb_attach)}
+            logger.debug("[%s] DIAG kb attach: %r", self.name, str(dump)[:1500])
+            extra = getattr(message, "model_extra", None) or {}
+            logger.debug(
+                "[%s] DIAG kb msg id=%r keys=%s extra=%r",
+                self.name, message.id, list(extra.keys()), str(extra)[:800],
+            )
+
+        # Токен нажатия сервер выдаёт вместе с клавиатурой; он не в модели
+        # PyMax, поэтому лежит в extra-полях вложения.
+        kb_extra = getattr(kb_attach, "model_extra", None) or {}
+        cb_token = kb_extra.get("callbackId") or kb_extra.get("callback_id")
+
+        raw_rows = kbd.get("buttons") or kbd.get("rows") or []
+        if raw_rows and isinstance(raw_rows[0], dict):
+            raw_rows = [raw_rows]  # плоский список кнопок
+
+        rows: list[list[InlineKeyboardButton]] = []
+        for raw_row in raw_rows[:12]:
+            row: list[InlineKeyboardButton] = []
+            for btn in (raw_row or [])[:8]:
+                if not isinstance(btn, dict):
+                    continue
+                text = str(
+                    btn.get("text") or btn.get("title") or btn.get("caption") or "•"
+                )[:64]
+                url = btn.get("url") or btn.get("link")
+                # Telegram принимает только http(s); max:// и прочее шлём как callback.
+                if isinstance(url, str) and url.startswith("http"):
+                    row.append(InlineKeyboardButton(text=text, url=url))
+                    continue
+                cb_id = self.manager.remember_cb({
+                    "account_id": self.account_id,
+                    "chat_id": message.chat_id,
+                    "message_id": message.id,
+                    "callback_id": cb_token,
+                    "payload": btn.get("payload") or btn.get("callback"),
+                    "text": text,
+                })
+                row.append(
+                    InlineKeyboardButton(text=text, callback_data=f"maxcb:{cb_id}")
+                )
+            if row:
+                rows.append(row)
+        return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+    async def _wait_online(self, timeout: float = 8.0) -> bool:
+        """Ждёт восстановления соединения с MAX."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._max_online():
+                return True
+            await asyncio.sleep(0.5)
+        return self._max_online()
+
+    async def press_max_button(
+        self, chat_id: int, message_id, payload: str | None, callback_id: str | None
+    ) -> str | None:
+        """Нажимает кнопку бота MAX. Возвращает текст ошибки или None."""
+        if callback_id is None:
+            return "У этой кнопки нет токена нажатия — попроси меню заново."
+
+        # callbackId сервер выдал сам (он его расшифровывает), payload
+        # указывает, какая именно кнопка нажата. Ошибка валидации рвёт
+        # соединение, поэтому перед каждой попыткой ждём переподключения.
+        variants = [
+            {
+                "chatId": chat_id,
+                "messageId": str(message_id),
+                "callbackId": callback_id,
+                "payload": payload,
+            },
+            {
+                "chatId": chat_id,
+                "messageId": str(message_id),
+                "callbackId": callback_id,
+            },
+            {"callbackId": callback_id, "payload": payload},
+        ]
+        last_error: Exception | None = None
+        for variant in variants:
+            if not await self._wait_online():
+                return "MAX переподключается — нажми ещё раз через пару секунд."
+            try:
+                result = await self._max_invoke(_OP_MSG_SEND_CALLBACK, variant)
+                logger.debug(
+                    "[%s] callback отправлен keys=%s -> %r",
+                    self.name, sorted(variant), str(result)[:300],
+                )
+                return None
+            except ConnectionError as e:
+                last_error = e
+                logger.debug("[%s] callback: нет связи: %s", self.name, e)
+            except Exception as e:
+                last_error = e
+                logger.info("[%s] callback keys=%s не прошёл: %s",
+                            self.name, sorted(variant), e)
+        return f"{type(last_error).__name__}: {last_error}"
 
     def _diag_attach(self, attach) -> None:
         """Один раз на тип логирует сырое вложение — чтобы отрисовать его потом."""
@@ -1213,6 +1382,89 @@ class Account:
                 return None
             return await resp.read()
 
+    async def _max_invoke(self, opcode: int, payload: dict) -> dict | None:
+        """Низкоуровневый вызов опкода MAX. Возвращает payload ответа."""
+        app = getattr(self.client, "_app", None)
+        if app is None:
+            return None
+        resp = await app.invoke(opcode, payload)
+        return getattr(resp, "payload", None)
+
+    async def cmd_rawop(self, message: TgMessage) -> None:
+        """Отладка: /rawop <opcode> <json-payload> — сырой вызов опкода MAX."""
+        import json as _json
+        parts = (message.text or "").split(maxsplit=2)
+        if len(parts) < 3:
+            await message.reply(
+                "Использование: <code>/rawop 60 {\"query\":\"rb_k_vrachu_bot\"}</code>",
+                parse_mode="HTML",
+            )
+            return
+        try:
+            opcode = int(parts[1])
+            payload = _json.loads(parts[2])
+        except Exception as e:
+            await message.reply(f"⚠️ Не разобрал аргументы: {e}")
+            return
+        try:
+            result = await self._max_invoke(opcode, payload)
+        except Exception as e:
+            await message.reply(f"⚠️ opcode={opcode}: {type(e).__name__}: {e}")
+            return
+        dump = _json.dumps(result, ensure_ascii=False, indent=1, default=str)
+        if len(dump) > 3500:
+            dump = dump[:3500] + "\n… (обрезано)"
+        await message.reply(
+            f"opcode={opcode} →\n<pre>{dump}</pre>", parse_mode="HTML"
+        )
+
+    async def _search_max_contacts(self, query: str):
+        """Ищет пользователя или бота MAX через CONTACT_SEARCH (opcode 37).
+
+        PyMax не оборачивает этот опкод, поэтому дёргаем его напрямую.
+        Ответ: {"result": [{"contact": {...}, "summary": "@username"}], "total": N}
+        """
+        q = query.lower().lstrip("@")
+        try:
+            payload = await self._max_invoke(_OP_CONTACT_SEARCH, {"query": q, "count": 10})
+        except Exception as e:
+            logger.debug("[%s] CONTACT_SEARCH(%s) не удался: %s", self.name, q, e)
+            return None
+
+        items = (payload or {}).get("result") or []
+        if not items:
+            return None
+
+        def _is_exact(item: dict) -> bool:
+            contact = item.get("contact") or {}
+            link = str(contact.get("link") or "").rstrip("/").split("/")[-1].lower()
+            summary = str(item.get("summary") or "").lstrip("@").lower()
+            return q in (link, summary)
+
+        chosen = next((i for i in items if _is_exact(i)), None)
+        if chosen is None and len(items) == 1:
+            chosen = items[0]
+        if chosen is None:
+            return None
+
+        contact = chosen.get("contact") or {}
+        uid = contact.get("id")
+        if not uid:
+            return None
+
+        # Полноценный User-объект: сначала через клиент, иначе валидируем ответ.
+        try:
+            user = await self.client.get_user(int(uid))
+            if user is not None:
+                return user
+        except Exception:
+            logger.debug("get_user(%s) после CONTACT_SEARCH не удался", uid, exc_info=True)
+        try:
+            return MaxUser.model_validate(contact)
+        except Exception:
+            logger.debug("Не разобрать contact из CONTACT_SEARCH", exc_info=True)
+            return None
+
     # ── Telegram -> MAX ───────────────────────────────────────────────────
 
     async def handle_tg(self, message: TgMessage) -> None:
@@ -1292,6 +1544,7 @@ class Account:
                 "Варианты:\n"
                 "• Номер телефона: +79991234567\n"
                 "• Username MAX: someusername\n"
+                "• Ссылка на профиль/бота: https://max.ru/username\n"
                 "• MAX user ID (число): 123456789\n\n"
                 "Если знаешь MAX user ID — введи его напрямую, это самый надёжный способ."
             )
@@ -1312,7 +1565,18 @@ class Account:
             await hint.edit_text("⚠️ Не удалось определить ID аккаунта MAX.")
             return
         max_chat_id = my_id ^ user_id
+        await self._confirm_new_chat(message, hint, user, user_id, max_chat_id, first_text)
 
+    async def _confirm_new_chat(
+        self,
+        message: TgMessage,
+        hint,
+        user,
+        user_id: int,
+        max_chat_id: int,
+        first_text: str = "",
+    ) -> None:
+        """Показывает подтверждение создания нового чата с пользователем/ботом MAX."""
         # Уже есть тема — проверяем реальным сообщением, что она жива.
         existing_thread = await self.storage.get_topic(max_chat_id)
         if existing_thread is not None:
@@ -1337,13 +1601,15 @@ class Account:
             except TelegramBadRequest as e:
                 if "thread not found" in str(e).lower():
                     await self.storage.clear_topic(max_chat_id)
-                    existing_thread = None
                 else:
                     raise
 
-        # Запрашиваем подтверждение перед отправкой.
+        # MAX помечает ботов через options: ["TT", "ONEME", "OFFICIAL", "BOT"].
+        opts = {str(o).upper() for o in (getattr(user, "options", None) or [])}
+        is_bot = "BOT" in opts or bool(getattr(user, "is_bot", False))
         name = self._label_for(user, user_id)
-        send_text = first_text or "👋"
+        icon = "🤖" if is_bot else "👤"
+        send_text = first_text or ("/start" if is_bot else "👋")
         self.manager._req_counter += 1
         req_id = self.manager._req_counter
         self.manager.pending_chats[req_id] = {
@@ -1366,15 +1632,15 @@ class Account:
             ],
             [
                 InlineKeyboardButton(
-                    text="👤 Профиль",
+                    text=f"{icon} Профиль",
                     callback_data=f"acc:profile:{self.account_id}:{user_id}",
                 ),
             ],
         ])
         caption = (
-            f"👤 Найден: «{name}» (MAX ID {user_id})\n\n"
+            f"{icon} Найден: «{name}» (MAX ID {user_id})\n\n"
             f"Первое сообщение: «{send_text}»\n\n"
-            "Начать чат?"
+            f"{'Открыть диалог с ботом?' if is_bot else 'Начать чат?'}"
         )
         avatar = await self._get_user_avatar(user, max_chat_id)
         if avatar:
@@ -1482,17 +1748,55 @@ class Account:
             await message.answer(text, parse_mode="HTML")
 
     async def _handle_invite_link(self, message: TgMessage, link: str) -> None:
-        """Обработка ссылки-приглашения MAX в General-теме."""
-        hint = await message.reply("🔍 Получаю информацию о канале/группе…")
+        """Обработка ссылки MAX в General-теме: канал/группа или профиль пользователя/бота."""
+        hint = await message.reply("🔍 Получаю информацию…")
+        chat = None
+        resolve_error = None
         try:
             chat = await self.client.resolve_group_by_link(link)
         except Exception as e:
-            await hint.edit_text(f"⚠️ Не удалось получить информацию: {e}")
-            return
+            resolve_error = e
 
-        if chat is None:
-            await hint.edit_text("❌ Ссылка не распознана или недействительна.")
-            return
+        # Если resolve вернул None или упал — пробуем как профиль пользователя/бота.
+        if chat is None or str(getattr(chat, "type", "")).upper() == "DIALOG":
+            from urllib.parse import urlparse
+            username = urlparse(link).path.strip("/").split("/")[-1]
+            me = self.client.me
+            my_id = (
+                me.contact.id
+                if me is not None and getattr(me, "contact", None) is not None
+                else getattr(me, "id", None) if me is not None else None
+            )
+            if my_id is None:
+                await hint.edit_text("⚠️ Аккаунт MAX ещё не готов.")
+                return
+
+            user = None
+            if username:
+                try:
+                    user = await self._find_max_user(username)
+                except Exception:
+                    logger.debug("поиск %s не удался", username, exc_info=True)
+
+            if user is not None:
+                user_id: int = getattr(user, "id", None) or getattr(user, "contact", user).id
+                max_chat_id = my_id ^ user_id
+                await self._confirm_new_chat(message, hint, user, user_id, max_chat_id)
+                return
+
+            if chat is not None:
+                # resolve с username вернул группу — продолжаем как обычно ниже
+                pass
+            else:
+                # Совсем не нашли — предлагаем ввести числовой ID.
+                await hint.edit_text(
+                    f"❌ Не удалось найти «{username or link}» в MAX.\n\n"
+                    "Если это бот или пользователь, введи его числовой MAX ID "
+                    "прямо в General (например: <code>123456789</code>).\n\n"
+                    "Числовой ID можно узнать из профиля в приложении MAX.",
+                    parse_mode="HTML",
+                )
+                return
 
         title = getattr(chat, "title", None) or f"чат {getattr(chat, 'id', '?')}"
         chat_type = getattr(chat, "type", None)
@@ -1560,8 +1864,16 @@ class Account:
             except Exception:
                 logger.debug("get_user(%s) не удался", uid, exc_info=True)
 
-        # 3) Поиск по username/имени среди известных чатов (обновляем список).
+        # 3) Глобальный поиск по username/имени на стороне MAX.
         q = query.lower().lstrip("@")
+        if not is_phone:
+            found = await self._search_max_contacts(q)
+            if found is not None:
+                logger.info("[%s] _find_max_user: нашли через CONTACT_SEARCH(%s) id=%s",
+                            self.name, q, getattr(found, "id", "?"))
+                return found
+
+        # 4) Поиск по username/имени среди известных чатов (обновляем список).
         try:
             await self.client.get_chats()
         except Exception:
@@ -1876,6 +2188,9 @@ class Account:
             )
             return
         text = message.text or message.caption or ""
+        # «//leave» — способ отправить в MAX команду, которую иначе перехватит мост.
+        if text.startswith("//"):
+            text = text[1:]
         attachments = await self._collect_outgoing_media(message)
         if not text and not attachments:
             return
@@ -1963,6 +2278,9 @@ class Manager:
         self.pending_joins: dict[int, dict] = {}
         # Ожидающие подтверждения выхода: req_id -> {account_id, max_chat_id, thread_id, title, chat_type}
         self.pending_leaves: dict[int, dict] = {}
+        # Кнопки ботов MAX: cb_id -> {account_id, chat_id, message_id, payload, text}
+        self._cb_counter = 0
+        self.pending_cb: dict[int, dict] = {}
         # Антифлуд: попытки /add и кулдауны «тяжёлых» команд (по монотонным сек).
         self._add_times: dict[int, list[float]] = {}
         self._cmd_times: dict[tuple[int, str], float] = {}
@@ -2226,7 +2544,7 @@ class Manager:
     def _register_handlers(self) -> None:
         dp = self.dp
 
-        @dp.message(Command("start", "help"))
+        @dp.message(Command("start", "help"), F.chat.type == "private")
         async def cmd_start(message: TgMessage) -> None:
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [
@@ -2244,7 +2562,7 @@ class Manager:
                 reply_markup=kb,
             )
 
-        @dp.message(Command("setproxy"))
+        @dp.message(Command("setproxy"), F.chat.type == "private")
         async def cmd_setproxy(
             message: TgMessage, command: CommandObject
         ) -> None:
@@ -2287,7 +2605,7 @@ class Manager:
             )
             await self._restart_account(account_id, announce=True)
 
-        @dp.message(Command("relogin"))
+        @dp.message(Command("relogin"), F.chat.type == "private")
         async def cmd_relogin(
             message: TgMessage, command: CommandObject
         ) -> None:
@@ -2311,7 +2629,7 @@ class Manager:
             await message.reply("🔄 Перезапускаю вход в MAX…")
             await self._restart_account(account_id, announce=True)
 
-        @dp.message(Command("add"))
+        @dp.message(Command("add"), F.chat.type == "private")
         async def cmd_add(message: TgMessage) -> None:
             if message.chat.type != "private":
                 await message.reply("Добавляй аккаунт в личке со мной.")
@@ -2330,11 +2648,11 @@ class Manager:
                 "+79991234567"
             )
 
-        @dp.message(Command("accounts"))
+        @dp.message(Command("accounts"), F.chat.type == "private")
         async def cmd_accounts(message: TgMessage) -> None:
             await self._send_accounts_list(message.from_user.id, message)
 
-        @dp.message(Command("remove"))
+        @dp.message(Command("remove"), F.chat.type == "private")
         async def cmd_remove(message: TgMessage, command: CommandObject) -> None:
             tg = message.from_user.id
             arg = (command.args or "").strip()
@@ -2445,7 +2763,11 @@ class Manager:
         async def cmd_muted(message: TgMessage) -> None:
             await self._route_command(message, "muted")
 
-        @dp.message(Command("admin"))
+        @dp.message(Command("rawop"))
+        async def cmd_rawop(message: TgMessage) -> None:
+            await self._route_command(message, "rawop")
+
+        @dp.message(Command("admin"), F.chat.type == "private")
         async def cmd_admin(message: TgMessage, command: CommandObject) -> None:
             if message.from_user.id not in self.admin_ids:
                 return  # тихо игнорируем для не-админов
@@ -2467,7 +2789,7 @@ class Manager:
                     "stop N | start N | remove N"
                 )
 
-        @dp.message(Command("ban"))
+        @dp.message(Command("ban"), F.chat.type == "private")
         async def cmd_ban(message: TgMessage, command: CommandObject) -> None:
             if message.from_user.id not in self.admin_ids:
                 return
@@ -2496,7 +2818,7 @@ class Manager:
             except Exception:
                 pass
 
-        @dp.message(Command("unban"))
+        @dp.message(Command("unban"), F.chat.type == "private")
         async def cmd_unban(message: TgMessage, command: CommandObject) -> None:
             if message.from_user.id not in self.admin_ids:
                 return
@@ -2507,7 +2829,7 @@ class Manager:
             await self.registry.unban(int(arg))
             await message.reply(f"✅ Пользователь {arg} разбанен.")
 
-        @dp.message(Command("banned"))
+        @dp.message(Command("banned"), F.chat.type == "private")
         async def cmd_banned(message: TgMessage) -> None:
             if message.from_user.id not in self.admin_ids:
                 return
@@ -2519,7 +2841,7 @@ class Manager:
                 "🚫 Забанены:\n" + "\n".join(str(i) for i in ids)
             )
 
-        @dp.message(Command("backup"))
+        @dp.message(Command("backup"), F.chat.type == "private")
         async def cmd_backup(message: TgMessage) -> None:
             if message.from_user.id not in self.admin_ids:
                 return
@@ -2543,7 +2865,7 @@ class Manager:
                     "в Telegram, скопируй с сервера вручную)."
                 )
 
-        @dp.message(Command("restore"))
+        @dp.message(Command("restore"), F.chat.type == "private")
         async def cmd_restore(message: TgMessage) -> None:
             if message.from_user.id not in self.admin_ids:
                 return
@@ -2610,6 +2932,8 @@ class Manager:
                 await self._handle_adm(cb)
             elif data.startswith("acc:"):
                 await self._handle_acc(cb)
+            elif data.startswith("maxcb:"):
+                await self._handle_maxcb(cb)
             else:
                 await cb.answer()
 
@@ -2661,6 +2985,11 @@ class Manager:
             await worker.toggle_mute(message, muted=False)
         elif cmd == "muted":
             await worker.list_muted(message)
+        elif cmd == "rawop":
+            if message.from_user.id not in self.admin_ids:
+                await message.reply("Только для админа.")
+                return
+            await worker.cmd_rawop(message)
 
     # ── админ-панель ──────────────────────────────────────────────────────
 
@@ -3109,6 +3438,43 @@ class Manager:
             worker.name, type_label, joined_title, link,
         )
 
+    def remember_cb(self, data: dict) -> int:
+        """Запоминает кнопку MAX и возвращает короткий id для callback_data."""
+        self._cb_counter += 1
+        cb_id = self._cb_counter
+        self.pending_cb[cb_id] = data
+        # Кнопки копятся за всё время работы — держим только свежие.
+        if len(self.pending_cb) > 3000:
+            for stale in sorted(self.pending_cb)[:1000]:
+                self.pending_cb.pop(stale, None)
+        return cb_id
+
+    async def _handle_maxcb(self, cb: CallbackQuery) -> None:
+        """Нажатие на кнопку бота MAX, проброшенную в Telegram."""
+        _, _, rid = (cb.data or "").partition(":")
+        req = self.pending_cb.get(int(rid)) if rid.isdigit() else None
+        if req is None:
+            await cb.answer(
+                "Кнопка устарела — попроси бота прислать меню заново.",
+                show_alert=True,
+            )
+            return
+        worker = self.workers.get(req["account_id"])
+        if worker is None:
+            await cb.answer("Аккаунт недоступен.", show_alert=True)
+            return
+        if cb.from_user.id != worker.owner_tg_id:
+            await cb.answer("Это не твой аккаунт.", show_alert=True)
+            return
+
+        error = await worker.press_max_button(
+            req["chat_id"], req["message_id"], req["payload"], req.get("callback_id"),
+        )
+        if error is None:
+            await cb.answer(f"▶️ {req['text']}")
+        else:
+            await cb.answer(f"⚠️ Не нажалось: {error}", show_alert=True)
+
     async def _handle_btn(self, cb: CallbackQuery) -> None:
         """Кнопки в личке: btn:add, btn:accounts, btn:remove:N, btn:relogin:N."""
         parts = (cb.data or "").split(":")
@@ -3148,8 +3514,8 @@ class Manager:
                 "/muted — список замьюченных чатов\n"
                 "\n"
                 "<b>━━ Тема «General» в группе ━━</b>\n"
-                "📱 Отправь номер телефона (+79…) или username (@user) "
-                "→ найдёт пользователя в MAX и предложит создать чат\n"
+                "📱 Отправь номер телефона (+79…), username (@user) или ссылку "
+                "https://max.ru/username → найдёт пользователя или бота в MAX и предложит открыть чат\n"
                 "🔗 Отправь ссылку на MAX-канал/группу → предложит вступить\n"
                 "/dm @username — написать пользователю напрямую по username\n"
                 "/leave — выбрать чат/канал и покинуть его\n"
@@ -3162,6 +3528,12 @@ class Manager:
                 "/profile — показать профиль собеседника\n"
                 "/dm @username — написать другому пользователю MAX\n"
                 "  (ответь реплаем на сообщение — откроет чат с его автором)\n"
+                "\n"
+                "🤖 <b>Чаты с ботами MAX</b>\n"
+                "Кнопки бота приходят прямо в тему — жми их как обычные.\n"
+                "Команды (/start и любые другие) уходят боту в MAX.\n"
+                "Если команда совпала с командой моста (например /leave), "
+                "поставь двойной слэш: <code>//leave</code>\n"
             )
             await cb.message.answer(help_text, parse_mode="HTML")
 
