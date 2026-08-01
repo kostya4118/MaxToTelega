@@ -1143,6 +1143,11 @@ class Account:
                 self.name, message.id, list(extra.keys()), str(extra)[:800],
             )
 
+        # Токен нажатия сервер выдаёт вместе с клавиатурой; он не в модели
+        # PyMax, поэтому лежит в extra-полях вложения.
+        kb_extra = getattr(kb_attach, "model_extra", None) or {}
+        cb_token = kb_extra.get("callbackId") or kb_extra.get("callback_id")
+
         raw_rows = kbd.get("buttons") or kbd.get("rows") or []
         if raw_rows and isinstance(raw_rows[0], dict):
             raw_rows = [raw_rows]  # плоский список кнопок
@@ -1167,6 +1172,7 @@ class Account:
                     "account_id": self.account_id,
                     "chat_id": message.chat_id,
                     "message_id": message.id,
+                    "callback_id": cb_token,
                     "payload": btn.get("payload") or btn.get("callback"),
                     "text": text,
                 }
@@ -1187,24 +1193,28 @@ class Account:
         return self._max_online()
 
     async def press_max_button(
-        self, chat_id: int, message_id, payload: str | None
+        self, chat_id: int, message_id, payload: str | None, callback_id: str | None
     ) -> str | None:
         """Нажимает кнопку бота MAX. Возвращает текст ошибки или None."""
-        if payload is None:
-            return "У этой кнопки нет данных для нажатия."
+        if callback_id is None:
+            return "У этой кнопки нет токена нажатия — попроси меню заново."
 
-        # Сервер требует callbackId; остальные варианты — на случай иной схемы.
-        # Неверный payload валит валидацию и рвёт соединение, поэтому перед
-        # каждой попыткой ждём, пока клиент переподключится.
+        # callbackId сервер выдал сам (он его расшифровывает), payload
+        # указывает, какая именно кнопка нажата. Ошибка валидации рвёт
+        # соединение, поэтому перед каждой попыткой ждём переподключения.
         variants = [
-            {"chatId": chat_id, "messageId": str(message_id), "callbackId": payload},
-            {"chatId": chat_id, "messageId": message_id, "callbackId": payload},
             {
                 "chatId": chat_id,
                 "messageId": str(message_id),
-                "callbackId": payload,
+                "callbackId": callback_id,
                 "payload": payload,
             },
+            {
+                "chatId": chat_id,
+                "messageId": str(message_id),
+                "callbackId": callback_id,
+            },
+            {"callbackId": callback_id, "payload": payload},
         ]
         last_error: Exception | None = None
         for variant in variants:
@@ -3424,7 +3434,7 @@ class Manager:
             return
 
         error = await worker.press_max_button(
-            req["chat_id"], req["message_id"], req["payload"]
+            req["chat_id"], req["message_id"], req["payload"], req.get("callback_id"),
         )
         if error is None:
             await cb.answer(f"▶️ {req['text']}")
