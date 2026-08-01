@@ -1136,9 +1136,9 @@ class Account:
                 dump = kb_attach.model_dump()
             except Exception:
                 dump = {"repr": repr(kb_attach)}
-            logger.warning("[%s] DIAG kb attach: %r", self.name, str(dump)[:1500])
+            logger.debug("[%s] DIAG kb attach: %r", self.name, str(dump)[:1500])
             extra = getattr(message, "model_extra", None) or {}
-            logger.warning(
+            logger.debug(
                 "[%s] DIAG kb msg id=%r keys=%s extra=%r",
                 self.name, message.id, list(extra.keys()), str(extra)[:800],
             )
@@ -1166,16 +1166,14 @@ class Account:
                 if isinstance(url, str) and url.startswith("http"):
                     row.append(InlineKeyboardButton(text=text, url=url))
                     continue
-                self.manager._cb_counter += 1
-                cb_id = self.manager._cb_counter
-                self.manager.pending_cb[cb_id] = {
+                cb_id = self.manager.remember_cb({
                     "account_id": self.account_id,
                     "chat_id": message.chat_id,
                     "message_id": message.id,
                     "callback_id": cb_token,
                     "payload": btn.get("payload") or btn.get("callback"),
                     "text": text,
-                }
+                })
                 row.append(
                     InlineKeyboardButton(text=text, callback_data=f"maxcb:{cb_id}")
                 )
@@ -1222,7 +1220,7 @@ class Account:
                 return "MAX переподключается — нажми ещё раз через пару секунд."
             try:
                 result = await self._max_invoke(_OP_MSG_SEND_CALLBACK, variant)
-                logger.warning(
+                logger.debug(
                     "[%s] callback отправлен keys=%s -> %r",
                     self.name, sorted(variant), str(result)[:300],
                 )
@@ -1232,8 +1230,8 @@ class Account:
                 logger.debug("[%s] callback: нет связи: %s", self.name, e)
             except Exception as e:
                 last_error = e
-                logger.warning("[%s] callback keys=%s не прошёл: %s",
-                               self.name, sorted(variant), e)
+                logger.info("[%s] callback keys=%s не прошёл: %s",
+                            self.name, sorted(variant), e)
         return f"{type(last_error).__name__}: {last_error}"
 
     def _diag_attach(self, attach) -> None:
@@ -3414,6 +3412,17 @@ class Manager:
             "[%s] Вступил в %s «%s» по ссылке %s",
             worker.name, type_label, joined_title, link,
         )
+
+    def remember_cb(self, data: dict) -> int:
+        """Запоминает кнопку MAX и возвращает короткий id для callback_data."""
+        self._cb_counter += 1
+        cb_id = self._cb_counter
+        self.pending_cb[cb_id] = data
+        # Кнопки копятся за всё время работы — держим только свежие.
+        if len(self.pending_cb) > 3000:
+            for stale in sorted(self.pending_cb)[:1000]:
+                self.pending_cb.pop(stale, None)
+        return cb_id
 
     async def _handle_maxcb(self, cb: CallbackQuery) -> None:
         """Нажатие на кнопку бота MAX, проброшенную в Telegram."""
