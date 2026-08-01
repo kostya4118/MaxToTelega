@@ -1118,17 +1118,30 @@ class Account:
         Telegram, поэтому храним её в памяти и передаём короткий id.
         """
         kbd = None
+        kb_attach = None
         for attach in message.attaches:
             candidate = getattr(attach, "keyboard", None)
             if isinstance(candidate, dict):
                 kbd = candidate
+                kb_attach = attach
                 break
         if not kbd:
             return None
 
         if not self._diag_kb:
+            # Сервер расшифровывает callbackId, значит он приходит готовым —
+            # ищем его в самом вложении и в сыром сообщении.
             self._diag_kb = True
-            logger.warning("[%s] DIAG keyboard: %r", self.name, str(kbd)[:900])
+            try:
+                dump = kb_attach.model_dump()
+            except Exception:
+                dump = {"repr": repr(kb_attach)}
+            logger.warning("[%s] DIAG kb attach: %r", self.name, str(dump)[:1500])
+            extra = getattr(message, "model_extra", None) or {}
+            logger.warning(
+                "[%s] DIAG kb msg id=%r keys=%s extra=%r",
+                self.name, message.id, list(extra.keys()), str(extra)[:800],
+            )
 
         raw_rows = kbd.get("buttons") or kbd.get("rows") or []
         if raw_rows and isinstance(raw_rows[0], dict):
