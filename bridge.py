@@ -1128,7 +1128,7 @@ class Account:
 
         if not self._diag_kb:
             self._diag_kb = True
-            logger.info("[%s] DIAG keyboard: %r", self.name, str(kbd)[:900])
+            logger.warning("[%s] DIAG keyboard: %r", self.name, str(kbd)[:900])
 
         raw_rows = kbd.get("buttons") or kbd.get("rows") or []
         if raw_rows and isinstance(raw_rows[0], dict):
@@ -1170,6 +1170,14 @@ class Account:
         """Нажимает кнопку бота MAX. Возвращает текст ошибки или None."""
         if payload is None:
             return "У этой кнопки нет данных для нажатия."
+        # Соединение с MAX рвётся и восстанавливается само — ждём онлайна.
+        for _ in range(10):
+            if self._max_online():
+                break
+            await asyncio.sleep(0.5)
+        else:
+            return "MAX переподключается — нажми ещё раз через пару секунд."
+
         # Точный формат MSG_SEND_CALLBACK неизвестен — пробуем известные варианты.
         variants = [
             {"chatId": chat_id, "messageId": str(message_id), "payload": payload},
@@ -1180,15 +1188,19 @@ class Account:
         for variant in variants:
             try:
                 result = await self._max_invoke(_OP_MSG_SEND_CALLBACK, variant)
-                logger.info(
+                logger.warning(
                     "[%s] callback отправлен keys=%s -> %r",
                     self.name, sorted(variant), str(result)[:300],
                 )
                 return None
+            except ConnectionError as e:
+                # Сорвалось соединение, а не формат — перебирать смысла нет.
+                logger.debug("[%s] callback: нет связи: %s", self.name, e)
+                return "MAX переподключается — нажми ещё раз через пару секунд."
             except Exception as e:
                 last_error = e
-                logger.debug("[%s] callback keys=%s не прошёл: %s",
-                             self.name, sorted(variant), e)
+                logger.warning("[%s] callback keys=%s не прошёл: %s",
+                               self.name, sorted(variant), e)
         return f"{type(last_error).__name__}: {last_error}"
 
     def _diag_attach(self, attach) -> None:
