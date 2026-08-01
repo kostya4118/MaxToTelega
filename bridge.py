@@ -1213,6 +1213,42 @@ class Account:
                 return None
             return await resp.read()
 
+    async def _max_invoke(self, opcode: int, payload: dict) -> dict | None:
+        """Низкоуровневый вызов опкода MAX. Возвращает payload ответа."""
+        app = getattr(self.client, "_app", None)
+        if app is None:
+            return None
+        resp = await app.invoke(opcode, payload)
+        return getattr(resp, "payload", None)
+
+    async def cmd_rawop(self, message: TgMessage) -> None:
+        """Отладка: /rawop <opcode> <json-payload> — сырой вызов опкода MAX."""
+        import json as _json
+        parts = (message.text or "").split(maxsplit=2)
+        if len(parts) < 3:
+            await message.reply(
+                "Использование: <code>/rawop 60 {\"query\":\"rb_k_vrachu_bot\"}</code>",
+                parse_mode="HTML",
+            )
+            return
+        try:
+            opcode = int(parts[1])
+            payload = _json.loads(parts[2])
+        except Exception as e:
+            await message.reply(f"⚠️ Не разобрал аргументы: {e}")
+            return
+        try:
+            result = await self._max_invoke(opcode, payload)
+        except Exception as e:
+            await message.reply(f"⚠️ opcode={opcode}: {type(e).__name__}: {e}")
+            return
+        dump = _json.dumps(result, ensure_ascii=False, indent=1, default=str)
+        if len(dump) > 3500:
+            dump = dump[:3500] + "\n… (обрезано)"
+        await message.reply(
+            f"opcode={opcode} →\n<pre>{dump}</pre>", parse_mode="HTML"
+        )
+
     async def _resolve_max_username(self, username: str) -> int | None:
         """Резолвит username MAX (или бота) в числовой user ID через страницу профиля."""
         import json as _json
@@ -2570,6 +2606,10 @@ class Manager:
         async def cmd_muted(message: TgMessage) -> None:
             await self._route_command(message, "muted")
 
+        @dp.message(Command("rawop"))
+        async def cmd_rawop(message: TgMessage) -> None:
+            await self._route_command(message, "rawop")
+
         @dp.message(Command("admin"))
         async def cmd_admin(message: TgMessage, command: CommandObject) -> None:
             if message.from_user.id not in self.admin_ids:
@@ -2786,6 +2826,11 @@ class Manager:
             await worker.toggle_mute(message, muted=False)
         elif cmd == "muted":
             await worker.list_muted(message)
+        elif cmd == "rawop":
+            if message.from_user.id not in self.admin_ids:
+                await message.reply("Только для админа.")
+                return
+            await worker.cmd_rawop(message)
 
     # ── админ-панель ──────────────────────────────────────────────────────
 
