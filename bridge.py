@@ -1164,28 +1164,39 @@ class Account:
                 rows.append(row)
         return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
+    async def _wait_online(self, timeout: float = 8.0) -> bool:
+        """Ждёт восстановления соединения с MAX."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._max_online():
+                return True
+            await asyncio.sleep(0.5)
+        return self._max_online()
+
     async def press_max_button(
         self, chat_id: int, message_id, payload: str | None
     ) -> str | None:
         """Нажимает кнопку бота MAX. Возвращает текст ошибки или None."""
         if payload is None:
             return "У этой кнопки нет данных для нажатия."
-        # Соединение с MAX рвётся и восстанавливается само — ждём онлайна.
-        for _ in range(10):
-            if self._max_online():
-                break
-            await asyncio.sleep(0.5)
-        else:
-            return "MAX переподключается — нажми ещё раз через пару секунд."
 
-        # Точный формат MSG_SEND_CALLBACK неизвестен — пробуем известные варианты.
+        # Сервер требует callbackId; остальные варианты — на случай иной схемы.
+        # Неверный payload валит валидацию и рвёт соединение, поэтому перед
+        # каждой попыткой ждём, пока клиент переподключится.
         variants = [
-            {"chatId": chat_id, "messageId": str(message_id), "payload": payload},
-            {"chatId": chat_id, "messageId": message_id, "payload": payload},
             {"chatId": chat_id, "messageId": str(message_id), "callbackId": payload},
+            {"chatId": chat_id, "messageId": message_id, "callbackId": payload},
+            {
+                "chatId": chat_id,
+                "messageId": str(message_id),
+                "callbackId": payload,
+                "payload": payload,
+            },
         ]
         last_error: Exception | None = None
         for variant in variants:
+            if not await self._wait_online():
+                return "MAX переподключается — нажми ещё раз через пару секунд."
             try:
                 result = await self._max_invoke(_OP_MSG_SEND_CALLBACK, variant)
                 logger.warning(
@@ -1194,9 +1205,8 @@ class Account:
                 )
                 return None
             except ConnectionError as e:
-                # Сорвалось соединение, а не формат — перебирать смысла нет.
+                last_error = e
                 logger.debug("[%s] callback: нет связи: %s", self.name, e)
-                return "MAX переподключается — нажми ещё раз через пару секунд."
             except Exception as e:
                 last_error = e
                 logger.warning("[%s] callback keys=%s не прошёл: %s",
