@@ -66,6 +66,7 @@ from pymax.types.domain import (
     VideoAttachment,
 )
 from pymax.types.domain.enums import ChatType
+from pymax.types import User as MaxUser
 
 from config import Config
 from registry import Registry
@@ -145,6 +146,9 @@ if _LOG_FILE:
 
 TG_CAPTION_LIMIT = 1024
 PHONE_RE = re.compile(r"^\+\d{7,15}$")
+# Опкоды внутреннего протокола MAX, которые PyMax не оборачивает.
+_OP_CONTACT_SEARCH = 37
+
 MAX_LINK_RE = re.compile(
     r"https?://(?:[\w.-]*\.)?(?:max\.ru|oneme\.ru|o\.ru)/\S+",
     re.IGNORECASE,
@@ -1249,39 +1253,52 @@ class Account:
             f"opcode={opcode} →\n<pre>{dump}</pre>", parse_mode="HTML"
         )
 
-    async def _resolve_max_username(self, username: str) -> int | None:
-        """Резолвит username MAX (или бота) в числовой user ID через страницу профиля."""
-        import json as _json
-        url = f"https://max.ru/{username}"
+    async def _search_max_contacts(self, query: str):
+        """Ищет пользователя или бота MAX через CONTACT_SEARCH (opcode 37).
+
+        PyMax не оборачивает этот опкод, поэтому дёргаем его напрямую.
+        Ответ: {"result": [{"contact": {...}, "summary": "@username"}], "total": N}
+        """
+        q = query.lower().lstrip("@")
         try:
-            headers = {"User-Agent": "Mozilla/5.0 (compatible; MaxToTelega)"}
-            async with self.http.get(url, headers=headers, allow_redirects=True) as resp:
-                if resp.status != 200:
-                    logger.debug("_resolve_max_username %s -> HTTP %s", username, resp.status)
-                    return None
-                html = await resp.text(errors="replace")
+            payload = await self._max_invoke(_OP_CONTACT_SEARCH, {"query": q, "count": 10})
         except Exception as e:
-            logger.debug("_resolve_max_username HTTP error: %s", e)
+            logger.debug("[%s] CONTACT_SEARCH(%s) не удался: %s", self.name, q, e)
             return None
 
-        # Ищем числовой ID в JSON-LD, meta или window.__INITIAL_STATE__
-        patterns = [
-            r'"userId"\s*:\s*(\d+)',
-            r'"user_id"\s*:\s*(\d+)',
-            r'"id"\s*:\s*(\d+)',
-            r'userId["\s:]+(\d{6,})',
-            r'"uin"\s*:\s*"?(\d+)"?',
-            r'content="max://user/(\d+)"',
-        ]
-        for pat in patterns:
-            m = re.search(pat, html)
-            if m:
-                uid = int(m.group(1))
-                logger.info("_resolve_max_username %s -> %d (pattern %s)", username, uid, pat)
-                return uid
+        items = (payload or {}).get("result") or []
+        if not items:
+            return None
 
-        logger.debug("_resolve_max_username %s: ID не найден в HTML", username)
-        return None
+        def _is_exact(item: dict) -> bool:
+            contact = item.get("contact") or {}
+            link = str(contact.get("link") or "").rstrip("/").split("/")[-1].lower()
+            summary = str(item.get("summary") or "").lstrip("@").lower()
+            return q in (link, summary)
+
+        chosen = next((i for i in items if _is_exact(i)), None)
+        if chosen is None and len(items) == 1:
+            chosen = items[0]
+        if chosen is None:
+            return None
+
+        contact = chosen.get("contact") or {}
+        uid = contact.get("id")
+        if not uid:
+            return None
+
+        # Полноценный User-объект: сначала через клиент, иначе валидируем ответ.
+        try:
+            user = await self.client.get_user(int(uid))
+            if user is not None:
+                return user
+        except Exception:
+            logger.debug("get_user(%s) после CONTACT_SEARCH не удался", uid, exc_info=True)
+        try:
+            return MaxUser.model_validate(contact)
+        except Exception:
+            logger.debug("Не разобрать contact из CONTACT_SEARCH", exc_info=True)
+            return None
 
     # ── Telegram -> MAX ───────────────────────────────────────────────────
 
@@ -1422,10 +1439,9 @@ class Account:
                 else:
                     raise
 
-        is_bot = getattr(user, "is_bot", False) or (
-            getattr(user, "type", None) is not None
-            and str(getattr(user, "type", "")).upper() == "BOT"
-        )
+        # MAX помечает ботов через options: ["TT", "ONEME", "OFFICIAL", "BOT"].
+        opts = {str(o).upper() for o in (getattr(user, "options", None) or [])}
+        is_bot = "BOT" in opts or bool(getattr(user, "is_bot", False))
         name = self._label_for(user, user_id)
         icon = "🤖" if is_bot else "👤"
         send_text = first_text or ("/start" if is_bot else "👋")
@@ -1592,35 +1608,10 @@ class Account:
 
             user = None
             if username:
-                # Сначала ищем в кэше по username.
                 try:
                     user = await self._find_max_user(username)
                 except Exception:
-                    pass
-
-                # Кэш не помог — пробуем join_channel: оно отправляет ссылку
-                # как есть в CHAT_JOIN и может вернуть DIALOG-чат для бота.
-                if user is None:
-                    try:
-                        joined = await self.client.join_channel(link)
-                        if joined is not None:
-                            rtype = str(getattr(joined, "type", "")).upper()
-                            if rtype == "DIALOG":
-                                # DIALOG — это бот/пользователь; вычисляем его ID
-                                bot_id = getattr(joined, "id", None)
-                                if bot_id is not None:
-                                    bot_id = bot_id ^ my_id
-                                    user = await self.client.get_user(bot_id)
-                                    if user is None:
-                                        # создаём минимальный объект-заглушку
-                                        class _BotStub:
-                                            id = bot_id
-                                            is_bot = True
-                                        user = _BotStub()
-                            elif rtype in ("CHANNEL", "GROUP"):
-                                chat = joined
-                    except Exception as e:
-                        logger.debug("join_channel(%s) не помог: %s", link, e)
+                    logger.debug("поиск %s не удался", username, exc_info=True)
 
             if user is not None:
                 user_id: int = getattr(user, "id", None) or getattr(user, "contact", user).id
@@ -1708,8 +1699,16 @@ class Account:
             except Exception:
                 logger.debug("get_user(%s) не удался", uid, exc_info=True)
 
-        # 3) Поиск по username/имени среди известных чатов (обновляем список).
+        # 3) Глобальный поиск по username/имени на стороне MAX.
         q = query.lower().lstrip("@")
+        if not is_phone:
+            found = await self._search_max_contacts(q)
+            if found is not None:
+                logger.info("[%s] _find_max_user: нашли через CONTACT_SEARCH(%s) id=%s",
+                            self.name, q, getattr(found, "id", "?"))
+                return found
+
+        # 4) Поиск по username/имени среди известных чатов (обновляем список).
         try:
             await self.client.get_chats()
         except Exception:
@@ -1734,19 +1733,6 @@ class Account:
                     logger.info("[%s] _find_max_user: нашли в кэше чатов uid=%s",
                                 self.name, uid)
                     return cached
-
-        # 4) Резолв username через страницу профиля max.ru.
-        if not is_phone and not raw_digits.isdigit():
-            uid = await self._resolve_max_username(q)
-            if uid is not None:
-                try:
-                    user = await self.client.get_user(uid)
-                    if user is not None:
-                        logger.info("[%s] _find_max_user: нашли через профиль max.ru uid=%s",
-                                    self.name, uid)
-                        return user
-                except Exception:
-                    logger.debug("get_user(%s) после resolve не удался", uid, exc_info=True)
 
         logger.info("[%s] _find_max_user: не нашли %r", self.name, query)
         return None
