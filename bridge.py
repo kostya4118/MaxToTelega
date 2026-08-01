@@ -148,6 +148,7 @@ TG_CAPTION_LIMIT = 1024
 PHONE_RE = re.compile(r"^\+\d{7,15}$")
 # Опкоды внутреннего протокола MAX, которые PyMax не оборачивает.
 _OP_CONTACT_SEARCH = 37
+_OP_MSG_SEND_CALLBACK = 118
 
 MAX_LINK_RE = re.compile(
     r"https?://(?:[\w.-]*\.)?(?:max\.ru|oneme\.ru|o\.ru)/\S+",
@@ -376,6 +377,7 @@ class Account:
         self._seen_opcodes: set[int] = set()
         self._last_chat_reaction: tuple | None = None
         self._diag_attaches: set[str] = set()
+        self._diag_kb = False
         # Темы, созданные только что: Telegram авто-закрепляет первое
         # сообщение — снимем его после отправки.
         self._fresh_topics: set[int] = set()
@@ -960,6 +962,17 @@ class Account:
             )
             records.append((sent.message_id, "text"))
 
+        # Кнопки бота MAX вешаем на первое отправленное сообщение.
+        kb = self._kb_from_max(message)
+        if kb is not None and records:
+            try:
+                await self.bot.edit_message_reply_markup(
+                    chat_id=dest, message_id=records[0][0], reply_markup=kb,
+                )
+            except Exception:
+                logger.info("[%s] не прикрепить клавиатуру MAX",
+                            self.name, exc_info=True)
+
         for mid, role in records:
             # Текст храним у несущей роли — чтобы потом дописать реакции.
             await self.storage.remember_msg(
@@ -1056,6 +1069,8 @@ class Account:
                     notes.append("📞 звонок")
                 elif isinstance(attach, ControlAttachment):
                     notes.append("ℹ️ системное сообщение")
+                elif isinstance(getattr(attach, "keyboard", None), dict):
+                    pass  # клавиатуру рисуем кнопками, а не текстом
                 else:
                     t = getattr(attach, "type", None)
                     type_name = (
@@ -1093,6 +1108,88 @@ class Account:
                 logger.exception("Не удалось обработать вложение из MAX")
                 notes.append("📎 вложение (ошибка обработки)")
         return result, notes, specials
+
+    def _kb_from_max(self, message: Message) -> InlineKeyboardMarkup | None:
+        """Строит Telegram-клавиатуру из inline-кнопок бота MAX.
+
+        MAX отдаёт клавиатуру сырым dict-ом. Ожидаемая форма:
+        {"buttons": [[{"type": "CALLBACK", "text": "…", "payload": "…"}]]}
+        Полезная нагрузка кнопки длиннее 64 байт не влезает в callback_data
+        Telegram, поэтому храним её в памяти и передаём короткий id.
+        """
+        kbd = None
+        for attach in message.attaches:
+            candidate = getattr(attach, "keyboard", None)
+            if isinstance(candidate, dict):
+                kbd = candidate
+                break
+        if not kbd:
+            return None
+
+        if not self._diag_kb:
+            self._diag_kb = True
+            logger.info("[%s] DIAG keyboard: %r", self.name, str(kbd)[:900])
+
+        raw_rows = kbd.get("buttons") or kbd.get("rows") or []
+        if raw_rows and isinstance(raw_rows[0], dict):
+            raw_rows = [raw_rows]  # плоский список кнопок
+
+        rows: list[list[InlineKeyboardButton]] = []
+        for raw_row in raw_rows[:12]:
+            row: list[InlineKeyboardButton] = []
+            for btn in (raw_row or [])[:8]:
+                if not isinstance(btn, dict):
+                    continue
+                text = str(
+                    btn.get("text") or btn.get("title") or btn.get("caption") or "•"
+                )[:64]
+                url = btn.get("url") or btn.get("link")
+                # Telegram принимает только http(s); max:// и прочее шлём как callback.
+                if isinstance(url, str) and url.startswith("http"):
+                    row.append(InlineKeyboardButton(text=text, url=url))
+                    continue
+                self.manager._cb_counter += 1
+                cb_id = self.manager._cb_counter
+                self.manager.pending_cb[cb_id] = {
+                    "account_id": self.account_id,
+                    "chat_id": message.chat_id,
+                    "message_id": message.id,
+                    "payload": btn.get("payload") or btn.get("callback"),
+                    "text": text,
+                }
+                row.append(
+                    InlineKeyboardButton(text=text, callback_data=f"maxcb:{cb_id}")
+                )
+            if row:
+                rows.append(row)
+        return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+    async def press_max_button(
+        self, chat_id: int, message_id, payload: str | None
+    ) -> str | None:
+        """Нажимает кнопку бота MAX. Возвращает текст ошибки или None."""
+        if payload is None:
+            return "У этой кнопки нет данных для нажатия."
+        # Точный формат MSG_SEND_CALLBACK неизвестен — пробуем известные варианты.
+        variants = [
+            {"chatId": chat_id, "messageId": str(message_id), "payload": payload},
+            {"chatId": chat_id, "messageId": message_id, "payload": payload},
+            {"chatId": chat_id, "messageId": str(message_id), "callbackId": payload},
+        ]
+        last_error: Exception | None = None
+        for variant in variants:
+            try:
+                result = await self._max_invoke(_OP_MSG_SEND_CALLBACK, variant)
+                logger.info(
+                    "[%s] callback отправлен keys=%s -> %r",
+                    self.name, sorted(variant), str(result)[:300],
+                )
+                return None
+            except Exception as e:
+                last_error = e
+                logger.debug("[%s] callback keys=%s не прошёл: %s",
+                             self.name, sorted(variant), e)
+        return f"{type(last_error).__name__}: {last_error}"
 
     def _diag_attach(self, attach) -> None:
         """Один раз на тип логирует сырое вложение — чтобы отрисовать его потом."""
@@ -2110,6 +2207,9 @@ class Manager:
         self.pending_joins: dict[int, dict] = {}
         # Ожидающие подтверждения выхода: req_id -> {account_id, max_chat_id, thread_id, title, chat_type}
         self.pending_leaves: dict[int, dict] = {}
+        # Кнопки ботов MAX: cb_id -> {account_id, chat_id, message_id, payload, text}
+        self._cb_counter = 0
+        self.pending_cb: dict[int, dict] = {}
         # Антифлуд: попытки /add и кулдауны «тяжёлых» команд (по монотонным сек).
         self._add_times: dict[int, list[float]] = {}
         self._cmd_times: dict[tuple[int, str], float] = {}
@@ -2761,6 +2861,8 @@ class Manager:
                 await self._handle_adm(cb)
             elif data.startswith("acc:"):
                 await self._handle_acc(cb)
+            elif data.startswith("maxcb:"):
+                await self._handle_maxcb(cb)
             else:
                 await cb.answer()
 
@@ -3264,6 +3366,32 @@ class Manager:
             "[%s] Вступил в %s «%s» по ссылке %s",
             worker.name, type_label, joined_title, link,
         )
+
+    async def _handle_maxcb(self, cb: CallbackQuery) -> None:
+        """Нажатие на кнопку бота MAX, проброшенную в Telegram."""
+        _, _, rid = (cb.data or "").partition(":")
+        req = self.pending_cb.get(int(rid)) if rid.isdigit() else None
+        if req is None:
+            await cb.answer(
+                "Кнопка устарела — попроси бота прислать меню заново.",
+                show_alert=True,
+            )
+            return
+        worker = self.workers.get(req["account_id"])
+        if worker is None:
+            await cb.answer("Аккаунт недоступен.", show_alert=True)
+            return
+        if cb.from_user.id != worker.owner_tg_id:
+            await cb.answer("Это не твой аккаунт.", show_alert=True)
+            return
+
+        error = await worker.press_max_button(
+            req["chat_id"], req["message_id"], req["payload"]
+        )
+        if error is None:
+            await cb.answer(f"▶️ {req['text']}")
+        else:
+            await cb.answer(f"⚠️ Не нажалось: {error}", show_alert=True)
 
     async def _handle_btn(self, cb: CallbackQuery) -> None:
         """Кнопки в личке: btn:add, btn:accounts, btn:remove:N, btn:relogin:N."""
