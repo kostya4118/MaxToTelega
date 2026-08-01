@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 import aiohttp
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
@@ -2473,7 +2473,7 @@ class Manager:
     def _register_handlers(self) -> None:
         dp = self.dp
 
-        @dp.message(Command("start", "help"))
+        @dp.message(Command("start", "help"), F.chat.type == "private")
         async def cmd_start(message: TgMessage) -> None:
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [
@@ -2491,7 +2491,7 @@ class Manager:
                 reply_markup=kb,
             )
 
-        @dp.message(Command("setproxy"))
+        @dp.message(Command("setproxy"), F.chat.type == "private")
         async def cmd_setproxy(
             message: TgMessage, command: CommandObject
         ) -> None:
@@ -2534,7 +2534,7 @@ class Manager:
             )
             await self._restart_account(account_id, announce=True)
 
-        @dp.message(Command("relogin"))
+        @dp.message(Command("relogin"), F.chat.type == "private")
         async def cmd_relogin(
             message: TgMessage, command: CommandObject
         ) -> None:
@@ -2558,7 +2558,7 @@ class Manager:
             await message.reply("🔄 Перезапускаю вход в MAX…")
             await self._restart_account(account_id, announce=True)
 
-        @dp.message(Command("add"))
+        @dp.message(Command("add"), F.chat.type == "private")
         async def cmd_add(message: TgMessage) -> None:
             if message.chat.type != "private":
                 await message.reply("Добавляй аккаунт в личке со мной.")
@@ -2577,11 +2577,11 @@ class Manager:
                 "+79991234567"
             )
 
-        @dp.message(Command("accounts"))
+        @dp.message(Command("accounts"), F.chat.type == "private")
         async def cmd_accounts(message: TgMessage) -> None:
             await self._send_accounts_list(message.from_user.id, message)
 
-        @dp.message(Command("remove"))
+        @dp.message(Command("remove"), F.chat.type == "private")
         async def cmd_remove(message: TgMessage, command: CommandObject) -> None:
             tg = message.from_user.id
             arg = (command.args or "").strip()
@@ -2696,7 +2696,7 @@ class Manager:
         async def cmd_rawop(message: TgMessage) -> None:
             await self._route_command(message, "rawop")
 
-        @dp.message(Command("admin"))
+        @dp.message(Command("admin"), F.chat.type == "private")
         async def cmd_admin(message: TgMessage, command: CommandObject) -> None:
             if message.from_user.id not in self.admin_ids:
                 return  # тихо игнорируем для не-админов
@@ -2718,7 +2718,7 @@ class Manager:
                     "stop N | start N | remove N"
                 )
 
-        @dp.message(Command("ban"))
+        @dp.message(Command("ban"), F.chat.type == "private")
         async def cmd_ban(message: TgMessage, command: CommandObject) -> None:
             if message.from_user.id not in self.admin_ids:
                 return
@@ -2747,7 +2747,7 @@ class Manager:
             except Exception:
                 pass
 
-        @dp.message(Command("unban"))
+        @dp.message(Command("unban"), F.chat.type == "private")
         async def cmd_unban(message: TgMessage, command: CommandObject) -> None:
             if message.from_user.id not in self.admin_ids:
                 return
@@ -2758,7 +2758,7 @@ class Manager:
             await self.registry.unban(int(arg))
             await message.reply(f"✅ Пользователь {arg} разбанен.")
 
-        @dp.message(Command("banned"))
+        @dp.message(Command("banned"), F.chat.type == "private")
         async def cmd_banned(message: TgMessage) -> None:
             if message.from_user.id not in self.admin_ids:
                 return
@@ -2770,7 +2770,7 @@ class Manager:
                 "🚫 Забанены:\n" + "\n".join(str(i) for i in ids)
             )
 
-        @dp.message(Command("backup"))
+        @dp.message(Command("backup"), F.chat.type == "private")
         async def cmd_backup(message: TgMessage) -> None:
             if message.from_user.id not in self.admin_ids:
                 return
@@ -2794,7 +2794,7 @@ class Manager:
                     "в Telegram, скопируй с сервера вручную)."
                 )
 
-        @dp.message(Command("restore"))
+        @dp.message(Command("restore"), F.chat.type == "private")
         async def cmd_restore(message: TgMessage) -> None:
             if message.from_user.id not in self.admin_ids:
                 return
