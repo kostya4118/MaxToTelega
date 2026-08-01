@@ -2120,6 +2120,9 @@ class Account:
             )
             return
         text = message.text or message.caption or ""
+        # «//leave» — способ отправить в MAX команду, которую иначе перехватит мост.
+        if text.startswith("//"):
+            text = text[1:]
         attachments = await self._collect_outgoing_media(message)
         if not text and not attachments:
             return
@@ -3446,6 +3449,12 @@ class Manager:
                 "/profile — показать профиль собеседника\n"
                 "/dm @username — написать другому пользователю MAX\n"
                 "  (ответь реплаем на сообщение — откроет чат с его автором)\n"
+                "\n"
+                "🤖 <b>Чаты с ботами MAX</b>\n"
+                "Кнопки бота приходят прямо в тему — жми их как обычные.\n"
+                "Команды (/start и любые другие) уходят боту в MAX.\n"
+                "Если команда совпала с командой моста (например /leave), "
+                "поставь двойной слэш: <code>//leave</code>\n"
             )
             await cb.message.answer(help_text, parse_mode="HTML")
 
