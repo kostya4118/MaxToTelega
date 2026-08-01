@@ -1510,32 +1510,61 @@ class Account:
         if chat is None or str(getattr(chat, "type", "")).upper() == "DIALOG":
             from urllib.parse import urlparse
             username = urlparse(link).path.strip("/").split("/")[-1]
+            me = self.client.me
+            my_id = (
+                me.contact.id
+                if me is not None and getattr(me, "contact", None) is not None
+                else getattr(me, "id", None) if me is not None else None
+            )
+            if my_id is None:
+                await hint.edit_text("⚠️ Аккаунт MAX ещё не готов.")
+                return
+
+            user = None
             if username:
-                me = self.client.me
-                my_id = (
-                    me.contact.id
-                    if me is not None and getattr(me, "contact", None) is not None
-                    else getattr(me, "id", None) if me is not None else None
-                )
-                if my_id is None:
-                    await hint.edit_text("⚠️ Аккаунт MAX ещё не готов.")
-                    return
+                # Сначала ищем в кэше по username.
                 try:
                     user = await self._find_max_user(username)
-                except Exception as e:
-                    await hint.edit_text(f"⚠️ Ошибка поиска: {e}")
-                    return
-                if user is not None:
-                    user_id: int = getattr(user, "id", None) or user.contact.id
-                    max_chat_id = my_id ^ user_id
-                    await self._confirm_new_chat(message, hint, user, user_id, max_chat_id)
-                    return
-            # Не нашли ни как группу, ни как пользователя.
-            if resolve_error:
-                await hint.edit_text(f"⚠️ Не удалось получить информацию: {resolve_error}")
+                except Exception:
+                    pass
+
+                # Кэш не помог — пробуем resolve с одним username (без домена).
+                if user is None:
+                    try:
+                        resolved = await self.client.resolve_group_by_link(username)
+                        if resolved is not None:
+                            rtype = str(getattr(resolved, "type", "")).upper()
+                            if rtype == "DIALOG":
+                                # это пользователь/бот-объект
+                                uid = getattr(resolved, "id", None)
+                                if uid:
+                                    user = resolved
+                                    # нормализуем как user-объект
+                            elif rtype in ("CHANNEL", "GROUP"):
+                                # resolve вернул группу с коротким именем — всё-таки группа
+                                chat = resolved
+                    except Exception:
+                        pass
+
+            if user is not None:
+                user_id: int = getattr(user, "id", None) or getattr(user, "contact", user).id
+                max_chat_id = my_id ^ user_id
+                await self._confirm_new_chat(message, hint, user, user_id, max_chat_id)
+                return
+
+            if chat is not None:
+                # resolve с username вернул группу — продолжаем как обычно ниже
+                pass
             else:
-                await hint.edit_text("❌ Ссылка не распознана или недействительна.")
-            return
+                # Совсем не нашли — предлагаем ввести числовой ID.
+                await hint.edit_text(
+                    f"❌ Не удалось найти «{username or link}» в MAX.\n\n"
+                    "Если это бот или пользователь, введи его числовой MAX ID "
+                    "прямо в General (например: <code>123456789</code>).\n\n"
+                    "Числовой ID можно узнать из профиля в приложении MAX.",
+                    parse_mode="HTML",
+                )
+                return
 
         title = getattr(chat, "title", None) or f"чат {getattr(chat, 'id', '?')}"
         chat_type = getattr(chat, "type", None)
