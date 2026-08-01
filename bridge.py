@@ -3183,6 +3183,19 @@ class Manager:
                 pass
             await self._send_accounts_list(tg, cb=cb)
 
+        elif action == "startlogin" and len(parts) > 2:
+            phone = parts[2]
+            conv = self.conv.get(tg)
+            if conv is None or conv.step != "approved":
+                await cb.answer("Эта кнопка уже не активна.", show_alert=True)
+                return
+            await cb.answer("Запускаю вход…")
+            try:
+                await cb.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            await self._begin_login(tg, phone)
+
         elif action == "relogin" and len(parts) > 2 and parts[2].isdigit():
             account_id = int(parts[2])
             acc = await self.registry.get(account_id)
@@ -3407,7 +3420,23 @@ class Manager:
             except Exception:
                 pass
             await cb.answer("Одобрено")
-            await self._begin_login(requester, phone)
+            self.conv[requester] = Conv(step="approved")
+            kb_user = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="📲 Получить SMS-код",
+                    callback_data=f"btn:startlogin:{phone}",
+                ),
+            ]])
+            try:
+                await self.bot.send_message(
+                    requester,
+                    "✅ Заявка одобрена!\n\n"
+                    "Нажми кнопку ниже, когда будешь готов получить SMS-код "
+                    "(код действует ~2 минуты, поэтому не торопись).",
+                    reply_markup=kb_user,
+                )
+            except Exception:
+                pass
         else:
             self.conv.pop(requester, None)
             try:
