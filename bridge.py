@@ -2233,6 +2233,9 @@ class Manager:
                     InlineKeyboardButton(text="➕ Добавить аккаунт", callback_data="btn:add"),
                     InlineKeyboardButton(text="📋 Мои аккаунты", callback_data="btn:accounts"),
                 ],
+                [
+                    InlineKeyboardButton(text="ℹ️ Справка", callback_data="btn:help"),
+                ],
             ])
             await message.answer(
                 "Привет! Я зеркалю переписку MAX в Telegram.\n\n"
@@ -3129,6 +3132,38 @@ class Manager:
         elif action == "accounts":
             await cb.answer()
             await self._send_accounts_list(tg, cb=cb)
+
+        elif action == "help":
+            await cb.answer()
+            help_text = (
+                "📖 <b>Инструкция по командам</b>\n"
+                "\n"
+                "<b>━━ Личка с ботом ━━</b>\n"
+                "/start — главное меню с кнопками\n"
+                "/add — добавить аккаунт MAX (телефон + код)\n"
+                "/accounts — список твоих аккаунтов\n"
+                "/remove — удалить аккаунт MAX\n"
+                "/relogin — повторная авторизация аккаунта\n"
+                "/setproxy — задать прокси для аккаунта\n"
+                "/muted — список замьюченных чатов\n"
+                "\n"
+                "<b>━━ Тема «General» в группе ━━</b>\n"
+                "📱 Отправь номер телефона (+79…) или username (@user) "
+                "→ найдёт пользователя в MAX и предложит создать чат\n"
+                "🔗 Отправь ссылку на MAX-канал/группу → предложит вступить\n"
+                "/dm @username — написать пользователю напрямую по username\n"
+                "/leave — выбрать чат/канал и покинуть его\n"
+                "\n"
+                "<b>━━ Тема отдельного чата ━━</b>\n"
+                "✉️ Просто пиши — сообщения уходят в MAX\n"
+                "/mute — заглушить уведомления из этого чата\n"
+                "/unmute — включить уведомления обратно\n"
+                "/leave — покинуть этот чат/канал в MAX\n"
+                "/profile — показать профиль собеседника\n"
+                "/dm @username — написать другому пользователю MAX\n"
+                "  (ответь реплаем на сообщение — откроет чат с его автором)\n"
+            )
+            await cb.message.answer(help_text, parse_mode="HTML")
 
         elif action == "remove" and len(parts) > 2 and parts[2].isdigit():
             account_id = int(parts[2])
