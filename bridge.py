@@ -1292,6 +1292,7 @@ class Account:
                 "Варианты:\n"
                 "• Номер телефона: +79991234567\n"
                 "• Username MAX: someusername\n"
+                "• Ссылка на профиль/бота: https://max.ru/username\n"
                 "• MAX user ID (число): 123456789\n\n"
                 "Если знаешь MAX user ID — введи его напрямую, это самый надёжный способ."
             )
@@ -1312,7 +1313,18 @@ class Account:
             await hint.edit_text("⚠️ Не удалось определить ID аккаунта MAX.")
             return
         max_chat_id = my_id ^ user_id
+        await self._confirm_new_chat(message, hint, user, user_id, max_chat_id, first_text)
 
+    async def _confirm_new_chat(
+        self,
+        message: TgMessage,
+        hint,
+        user,
+        user_id: int,
+        max_chat_id: int,
+        first_text: str = "",
+    ) -> None:
+        """Показывает подтверждение создания нового чата с пользователем/ботом MAX."""
         # Уже есть тема — проверяем реальным сообщением, что она жива.
         existing_thread = await self.storage.get_topic(max_chat_id)
         if existing_thread is not None:
@@ -1337,13 +1349,16 @@ class Account:
             except TelegramBadRequest as e:
                 if "thread not found" in str(e).lower():
                     await self.storage.clear_topic(max_chat_id)
-                    existing_thread = None
                 else:
                     raise
 
-        # Запрашиваем подтверждение перед отправкой.
+        is_bot = getattr(user, "is_bot", False) or (
+            getattr(user, "type", None) is not None
+            and str(getattr(user, "type", "")).upper() == "BOT"
+        )
         name = self._label_for(user, user_id)
-        send_text = first_text or "👋"
+        icon = "🤖" if is_bot else "👤"
+        send_text = first_text or ("/start" if is_bot else "👋")
         self.manager._req_counter += 1
         req_id = self.manager._req_counter
         self.manager.pending_chats[req_id] = {
@@ -1366,15 +1381,15 @@ class Account:
             ],
             [
                 InlineKeyboardButton(
-                    text="👤 Профиль",
+                    text=f"{icon} Профиль",
                     callback_data=f"acc:profile:{self.account_id}:{user_id}",
                 ),
             ],
         ])
         caption = (
-            f"👤 Найден: «{name}» (MAX ID {user_id})\n\n"
+            f"{icon} Найден: «{name}» (MAX ID {user_id})\n\n"
             f"Первое сообщение: «{send_text}»\n\n"
-            "Начать чат?"
+            f"{'Открыть диалог с ботом?' if is_bot else 'Начать чат?'}"
         )
         avatar = await self._get_user_avatar(user, max_chat_id)
         if avatar:
@@ -1482,16 +1497,44 @@ class Account:
             await message.answer(text, parse_mode="HTML")
 
     async def _handle_invite_link(self, message: TgMessage, link: str) -> None:
-        """Обработка ссылки-приглашения MAX в General-теме."""
-        hint = await message.reply("🔍 Получаю информацию о канале/группе…")
+        """Обработка ссылки MAX в General-теме: канал/группа или профиль пользователя/бота."""
+        hint = await message.reply("🔍 Получаю информацию…")
+        chat = None
+        resolve_error = None
         try:
             chat = await self.client.resolve_group_by_link(link)
         except Exception as e:
-            await hint.edit_text(f"⚠️ Не удалось получить информацию: {e}")
-            return
+            resolve_error = e
 
-        if chat is None:
-            await hint.edit_text("❌ Ссылка не распознана или недействительна.")
+        # Если resolve вернул None или упал — пробуем как профиль пользователя/бота.
+        if chat is None or str(getattr(chat, "type", "")).upper() == "DIALOG":
+            from urllib.parse import urlparse
+            username = urlparse(link).path.strip("/").split("/")[-1]
+            if username:
+                me = self.client.me
+                my_id = (
+                    me.contact.id
+                    if me is not None and getattr(me, "contact", None) is not None
+                    else getattr(me, "id", None) if me is not None else None
+                )
+                if my_id is None:
+                    await hint.edit_text("⚠️ Аккаунт MAX ещё не готов.")
+                    return
+                try:
+                    user = await self._find_max_user(username)
+                except Exception as e:
+                    await hint.edit_text(f"⚠️ Ошибка поиска: {e}")
+                    return
+                if user is not None:
+                    user_id: int = getattr(user, "id", None) or user.contact.id
+                    max_chat_id = my_id ^ user_id
+                    await self._confirm_new_chat(message, hint, user, user_id, max_chat_id)
+                    return
+            # Не нашли ни как группу, ни как пользователя.
+            if resolve_error:
+                await hint.edit_text(f"⚠️ Не удалось получить информацию: {resolve_error}")
+            else:
+                await hint.edit_text("❌ Ссылка не распознана или недействительна.")
             return
 
         title = getattr(chat, "title", None) or f"чат {getattr(chat, 'id', '?')}"
@@ -3148,8 +3191,8 @@ class Manager:
                 "/muted — список замьюченных чатов\n"
                 "\n"
                 "<b>━━ Тема «General» в группе ━━</b>\n"
-                "📱 Отправь номер телефона (+79…) или username (@user) "
-                "→ найдёт пользователя в MAX и предложит создать чат\n"
+                "📱 Отправь номер телефона (+79…), username (@user) или ссылку "
+                "https://max.ru/username → найдёт пользователя или бота в MAX и предложит открыть чат\n"
                 "🔗 Отправь ссылку на MAX-канал/группу → предложит вступить\n"
                 "/dm @username — написать пользователю напрямую по username\n"
                 "/leave — выбрать чат/канал и покинуть его\n"
