@@ -18,7 +18,7 @@ class Storage:
         self._db: aiosqlite.Connection | None = None
 
     @classmethod
-    async def create(cls, db_path: str) -> "Storage":
+    async def create(cls, db_path: str) -> Storage:
         self = cls(db_path)
         self._db = await aiosqlite.connect(db_path)
         await self._db.execute(

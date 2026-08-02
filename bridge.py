@@ -20,12 +20,9 @@ import glob
 import logging
 import os
 import re
-import sqlite3
-import tarfile
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import datetime
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
@@ -39,11 +36,10 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InputMediaPhoto,
     InputMediaVideo,
+    MessageReactionUpdated,
     ReactionTypeEmoji,
 )
 from aiogram.types import Message as TgMessage
-from aiogram.types import MessageReactionUpdated
-
 from pymax import (
     ApiError,
     Client,
@@ -54,6 +50,7 @@ from pymax import (
     Photo,
     Video,
 )
+from pymax.types import User as MaxUser
 from pymax.types.domain import (
     AudioAttachment,
     CallAttachment,
@@ -66,11 +63,30 @@ from pymax.types.domain import (
     VideoAttachment,
 )
 from pymax.types.domain.enums import ChatType
-from pymax.types import User as MaxUser
 
+from backup import (
+    build_backup,
+    decrypt_file,
+    restore_backup,
+    secure_file,
+)
 from config import Config
 from registry import Registry
 from storage import Storage
+from utils import (
+    MAX_LINK_RE,
+    PHONE_RE,
+    TG_CAPTION_LIMIT,
+    TG_UPLOAD_LIMIT,
+    is_bot_contact,
+    looks_like_phone,
+    mask_phone,
+    parse_general_query,
+    parse_max_keyboard,
+    topic_link,
+    unescape_command,
+    username_from_link,
+)
 
 _LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 _LOG_FMT = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -144,42 +160,14 @@ if _LOG_FILE:
     except Exception:
         logger.warning("Не удалось настроить файловый лог %s", _LOG_FILE)
 
-TG_CAPTION_LIMIT = 1024
-PHONE_RE = re.compile(r"^\+\d{7,15}$")
 # Опкоды внутреннего протокола MAX, которые PyMax не оборачивает.
 _OP_CONTACT_SEARCH = 37
 _OP_MSG_SEND_CALLBACK = 118
 
-MAX_LINK_RE = re.compile(
-    r"https?://(?:[\w.-]*\.)?(?:max\.ru|oneme\.ru|o\.ru)/\S+",
-    re.IGNORECASE,
-)
 
-
-def _normalize_phone(raw: str) -> str | None:
-    """Приводит номер телефона любого формата к +7XXXXXXXXXX.
-
-    Примеры входных форматов:
-      +7 917 427-82-00  →  +79174278200
-      7 917 427 82 00   →  +79174278200
-      89174278200       →  +79174278200
-      79174278200       →  +79174278200
-    """
-    digits = re.sub(r"\D", "", raw)
-    if not digits:
-        return None
-    if digits.startswith("8") and len(digits) == 11:
-        digits = "7" + digits[1:]
-    if not digits.startswith("+"):
-        digits = "+" + digits
-    else:
-        digits = "+" + digits[1:]  # убираем случайный +
-    # Финальная нормализация: digits уже без "+"
-    digits = re.sub(r"\D", "", digits)
-    phone = "+" + digits
-    return phone if PHONE_RE.match(phone) else None
 AUTH_TIMEOUT = 300  # сек на ввод кода/пароля
-TG_UPLOAD_LIMIT = 45 * 1024 * 1024  # запас под лимит бота Telegram (~50 МБ)
+WATCHDOG_INTERVAL = 30  # как часто проверяем связь аккаунтов с MAX
+OFFLINE_ALERT_SEC = 300  # через сколько молчания предупредить владельца
 
 
 async def _retry_after_middleware(make_request, bot, method):
@@ -197,121 +185,6 @@ async def _retry_after_middleware(make_request, bot, method):
     return await make_request(bot, method)
 
 
-_ENC_MAGIC = b"MTTENC1\n"
-
-
-def _derive_key(passphrase: str, salt: bytes) -> bytes:
-    import base64
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(), length=32, salt=salt, iterations=200_000
-    )
-    return base64.urlsafe_b64encode(kdf.derive(passphrase.encode("utf-8")))
-
-
-def _encrypt_file(path: str, passphrase: str) -> str:
-    """Шифрует файл паролем (PBKDF2 + Fernet). Возвращает путь к .enc."""
-    from cryptography.fernet import Fernet
-
-    salt = os.urandom(16)
-    token = Fernet(_derive_key(passphrase, salt)).encrypt(
-        open(path, "rb").read()
-    )
-    enc = path + ".enc"
-    with open(enc, "wb") as f:
-        f.write(_ENC_MAGIC)
-        f.write(salt)
-        f.write(token)
-    os.remove(path)
-    return enc
-
-
-def _decrypt_file(path: str, passphrase: str) -> str:
-    """Расшифровывает .enc-файл. Возвращает путь к расшифрованному файлу."""
-    from cryptography.fernet import Fernet
-
-    with open(path, "rb") as f:
-        magic = f.read(len(_ENC_MAGIC))
-        if magic != _ENC_MAGIC:
-            raise ValueError("Файл не является зашифрованным бэкапом бота.")
-        salt = f.read(16)
-        token = f.read()
-    out = path.removesuffix(".enc") if path.endswith(".enc") else path + ".dec"
-    data = Fernet(_derive_key(passphrase, salt)).decrypt(token)
-    with open(out, "wb") as f:
-        f.write(data)
-    return out
-
-
-def _restore_backup(archive: str, work_dir: str) -> list[str]:
-    """Распаковывает *.db из бэкапа в work_dir. Возвращает список восстановленных файлов."""
-    restored = []
-    with tarfile.open(archive, "r:gz") as tar:
-        for member in tar.getmembers():
-            if not member.name.endswith(".db"):
-                continue
-            member.name = os.path.basename(member.name)
-            tar.extract(member, path=work_dir)
-            restored.append(member.name)
-    return restored
-
-
-def _sqlite_snapshot(src: str, dst: str) -> None:
-    """Консистентная копия SQLite-файла даже при открытом соединении."""
-    source = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
-    try:
-        target = sqlite3.connect(dst)
-        try:
-            source.backup(target)
-        finally:
-            target.close()
-    finally:
-        source.close()
-
-
-def _build_backup(
-    work_dir: str, backup_dir: str, keep: int, passphrase: str | None = None
-) -> str:
-    """Собирает tar.gz из всех *.db (сессии, реестр, маршрутизация). Ротирует.
-
-    Если задан passphrase — архив шифруется (на выходе .tar.gz.enc).
-    """
-    os.makedirs(backup_dir, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    archive = os.path.join(backup_dir, f"backup_{ts}.tar.gz")
-    with tempfile.TemporaryDirectory() as tmp:
-        for src in glob.glob(os.path.join(work_dir, "*.db")):
-            dst = os.path.join(tmp, os.path.basename(src))
-            try:
-                _sqlite_snapshot(src, dst)
-            except Exception:
-                import shutil
-                shutil.copy2(src, dst)
-        with tarfile.open(archive, "w:gz") as tar:
-            tar.add(tmp, arcname="data")
-    if passphrase:
-        try:
-            archive = _encrypt_file(archive, passphrase)
-        except Exception:
-            logger.warning(
-                "Не удалось зашифровать бэкап — оставляю без шифрования",
-                exc_info=True,
-            )
-    # Ротация: оставляем последние keep архивов (с .enc или без).
-    if keep > 0:
-        backups = sorted(
-            glob.glob(os.path.join(backup_dir, "backup_*.tar.gz*"))
-        )
-        for old in backups[:-keep]:
-            try:
-                os.remove(old)
-            except Exception:
-                pass
-    return archive
-
-
 @dataclass
 class Conv:
     """Состояние диалога с пользователем (онбординг аккаунта)."""
@@ -324,7 +197,7 @@ class Conv:
 class TelegramAuth:
     """Провайдер кода SMS и 2FA-пароля MAX — спрашивает у пользователя в Telegram."""
 
-    def __init__(self, manager: "Manager", tg_id: int) -> None:
+    def __init__(self, manager: Manager, tg_id: int) -> None:
         self._m = manager
         self._tg = tg_id
 
@@ -355,7 +228,7 @@ class Account:
         group_id: int | None,
         client: Client,
         storage: Storage,
-        manager: "Manager",
+        manager: Manager,
         forward_groups: bool = True,
     ) -> None:
         self.bot = bot
@@ -378,6 +251,10 @@ class Account:
         self._last_chat_reaction: tuple | None = None
         self._diag_attaches: set[str] = set()
         self._diag_kb = False
+        # Наблюдение за связью с MAX (см. Manager._check_connections).
+        self.offline_since: float | None = None
+        self.offline_notified = False
+        self.reconnects = 0
         # Клавиатуры, висящие на сообщениях TG: (chat_id, msg_id) -> markup.
         # Нужны, чтобы правка сообщения не сбрасывала кнопки.
         self._kb_cache: dict[tuple[int, int], InlineKeyboardMarkup] = {}
@@ -676,7 +553,7 @@ class Account:
                 self.name, max_msg_id,
             )
             return
-        tg_chat, tg_msg, role, body = target
+        tg_chat, tg_msg, role, _body = target
 
         # Доминирующая реакция (с наибольшим счётчиком).
         dominant = ""
@@ -1173,34 +1050,25 @@ class Account:
         kb_extra = getattr(kb_attach, "model_extra", None) or {}
         cb_token = kb_extra.get("callbackId") or kb_extra.get("callback_id")
 
-        raw_rows = kbd.get("buttons") or kbd.get("rows") or []
-        if raw_rows and isinstance(raw_rows[0], dict):
-            raw_rows = [raw_rows]  # плоский список кнопок
-
         rows: list[list[InlineKeyboardButton]] = []
-        for raw_row in raw_rows[:12]:
+        for parsed_row in parse_max_keyboard(kbd):
             row: list[InlineKeyboardButton] = []
-            for btn in (raw_row or [])[:8]:
-                if not isinstance(btn, dict):
-                    continue
-                text = str(
-                    btn.get("text") or btn.get("title") or btn.get("caption") or "•"
-                )[:64]
-                url = btn.get("url") or btn.get("link")
-                # Telegram принимает только http(s); max:// и прочее шлём как callback.
-                if isinstance(url, str) and url.startswith("http"):
-                    row.append(InlineKeyboardButton(text=text, url=url))
+            for btn in parsed_row:
+                if btn["url"]:
+                    row.append(InlineKeyboardButton(text=btn["text"], url=btn["url"]))
                     continue
                 cb_id = self.manager.remember_cb({
                     "account_id": self.account_id,
                     "chat_id": message.chat_id,
                     "message_id": message.id,
                     "callback_id": cb_token,
-                    "payload": btn.get("payload") or btn.get("callback"),
-                    "text": text,
+                    "payload": btn["payload"],
+                    "text": btn["text"],
                 })
                 row.append(
-                    InlineKeyboardButton(text=text, callback_data=f"maxcb:{cb_id}")
+                    InlineKeyboardButton(
+                        text=btn["text"], callback_data=f"maxcb:{cb_id}"
+                    )
                 )
             if row:
                 rows.append(row)
@@ -1376,11 +1244,36 @@ class Account:
         return None
 
     async def _download(self, url: str) -> bytes | None:
+        """Качает вложение в память, отсекая файлы больше лимита Telegram.
+
+        Без лимита одно большое видео выедает память процесса, а вместе с ним
+        падают все аккаунты на сервере.
+        """
         async with self.http.get(url) as resp:
             if resp.status != 200:
                 logger.warning("Скачивание %s -> HTTP %s", url, resp.status)
                 return None
-            return await resp.read()
+
+            declared = resp.content_length
+            if declared and declared > TG_UPLOAD_LIMIT:
+                logger.info(
+                    "[%s] вложение %s МБ больше лимита — пропускаем",
+                    self.name, declared // 1024 // 1024,
+                )
+                return None
+
+            chunks: list[bytes] = []
+            size = 0
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                size += len(chunk)
+                if size > TG_UPLOAD_LIMIT:
+                    logger.info(
+                        "[%s] вложение превысило лимит на загрузке — пропускаем",
+                        self.name,
+                    )
+                    return None
+                chunks.append(chunk)
+            return b"".join(chunks)
 
     async def _max_invoke(self, opcode: int, payload: dict) -> dict | None:
         """Низкоуровневый вызов опкода MAX. Возвращает payload ответа."""
@@ -1496,39 +1389,7 @@ class Account:
             await self._handle_invite_link(message, m.group(0))
             return
 
-        # Телефон может быть многословным: "7 917 427-82-00 Привет"
-        # Пробуем сначала распарсить весь текст как телефон (возможно с пробелами).
-        # Эвристика: если в тексте есть цифры и нет букв — это телефон целиком.
-        text_digits_only = re.sub(r"\D", "", text)
-        if text_digits_only and not re.search(r"[a-zA-Zа-яёА-ЯЁ]", text):
-            # Всё — цифры/разделители: весь текст — номер, текст сообщения пуст
-            normalized = _normalize_phone(text)
-            if normalized:
-                query = normalized
-                first_text = ""
-            else:
-                query = text.split()[0].lstrip("@")
-                first_text = " ".join(text.split()[1:])
-        else:
-            # Ищем граничу между номером и текстом сообщения.
-            # Телефон заканчивается, когда встречаем слово без цифр.
-            tokens = text.split()
-            phone_tokens: list[str] = []
-            rest_tokens: list[str] = []
-            for i, tok in enumerate(tokens):
-                if re.search(r"\d", tok) or tok.startswith("+"):
-                    phone_tokens.append(tok)
-                else:
-                    rest_tokens = tokens[i:]
-                    break
-            raw_phone = " ".join(phone_tokens)
-            normalized = _normalize_phone(raw_phone) if phone_tokens else None
-            if normalized:
-                query = normalized
-                first_text = " ".join(rest_tokens)
-            else:
-                query = tokens[0].lstrip("@")
-                first_text = " ".join(tokens[1:])
+        query, first_text = parse_general_query(text)
 
         hint = await message.reply("🔍 Ищу пользователя в MAX…")
 
@@ -1586,13 +1447,10 @@ class Account:
                 )
                 await self.bot.delete_message(self.group_id, probe.message_id)
                 name = self._label_for(user, user_id)
-                topic_link = (
-                    f"https://t.me/c/{str(self.group_id).lstrip('-100')}/{existing_thread}"
-                    if self.group_id else None
-                )
+                topic_url = topic_link(self.group_id, existing_thread)
                 kb = InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="💬 Открыть тему", url=topic_link)
-                ]]) if topic_link else None
+                    InlineKeyboardButton(text="💬 Открыть тему", url=topic_url)
+                ]]) if topic_url else None
                 await hint.edit_text(
                     f"💬 Чат с «{name}» уже есть.",
                     reply_markup=kb,
@@ -1604,9 +1462,9 @@ class Account:
                 else:
                     raise
 
-        # MAX помечает ботов через options: ["TT", "ONEME", "OFFICIAL", "BOT"].
-        opts = {str(o).upper() for o in (getattr(user, "options", None) or [])}
-        is_bot = "BOT" in opts or bool(getattr(user, "is_bot", False))
+        is_bot = is_bot_contact(getattr(user, "options", None)) or bool(
+            getattr(user, "is_bot", False)
+        )
         name = self._label_for(user, user_id)
         icon = "🤖" if is_bot else "👤"
         send_text = first_text or ("/start" if is_bot else "👋")
@@ -1759,8 +1617,7 @@ class Account:
 
         # Если resolve вернул None или упал — пробуем как профиль пользователя/бота.
         if chat is None or str(getattr(chat, "type", "")).upper() == "DIALOG":
-            from urllib.parse import urlparse
-            username = urlparse(link).path.strip("/").split("/")[-1]
+            username = username_from_link(link)
             me = self.client.me
             my_id = (
                 me.contact.id
@@ -1784,11 +1641,10 @@ class Account:
                 await self._confirm_new_chat(message, hint, user, user_id, max_chat_id)
                 return
 
-            if chat is not None:
-                # resolve с username вернул группу — продолжаем как обычно ниже
-                pass
-            else:
+            if chat is None:
                 # Совсем не нашли — предлагаем ввести числовой ID.
+                logger.info("[%s] ссылка %s не разобрана: %s",
+                            self.name, link, resolve_error)
                 await hint.edit_text(
                     f"❌ Не удалось найти «{username or link}» в MAX.\n\n"
                     "Если это бот или пользователь, введи его числовой MAX ID "
@@ -1797,6 +1653,7 @@ class Account:
                     parse_mode="HTML",
                 )
                 return
+            # resolve с username вернул группу — продолжаем как обычно ниже.
 
         title = getattr(chat, "title", None) or f"чат {getattr(chat, 'id', '?')}"
         chat_type = getattr(chat, "type", None)
@@ -1837,7 +1694,7 @@ class Account:
         raw_digits = query.lstrip("+")
 
         # 1) Поиск по телефону через search_by_phone.
-        is_phone = PHONE_RE.match(query) or (raw_digits.isdigit() and len(raw_digits) >= 7)
+        is_phone = looks_like_phone(query)
         if is_phone:
             phone = query if query.startswith("+") else f"+{raw_digits}"
             try:
@@ -1947,7 +1804,7 @@ class Account:
             text = f"🔔 Чат «{title}» — со звуком."
         await message.reply(text, reply_markup=kb)
 
-    async def cmd_dm(self, message: TgMessage, manager: "Manager") -> None:
+    async def cmd_dm(self, message: TgMessage, manager: Manager) -> None:
         """Открыть личный чат с отправителем сообщения, на которое сделан реплей."""
         reply = message.reply_to_message
         if reply is None:
@@ -2019,13 +1876,10 @@ class Account:
                     self.group_id, "…", message_thread_id=existing_thread
                 )
                 await self.bot.delete_message(self.group_id, probe.message_id)
-                topic_link = (
-                    f"https://t.me/c/{str(self.group_id).lstrip('-100')}/{existing_thread}"
-                    if self.group_id else None
-                )
+                topic_url = topic_link(self.group_id, existing_thread)
                 kb = InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="💬 Открыть тему", url=topic_link)
-                ]]) if topic_link else None
+                    InlineKeyboardButton(text="💬 Открыть тему", url=topic_url)
+                ]]) if topic_url else None
                 await hint.edit_text(
                     f"💬 Личный чат с «{name}» уже есть.",
                     reply_markup=kb,
@@ -2080,7 +1934,7 @@ class Account:
         else:
             await hint.edit_text(caption, reply_markup=kb)
 
-    async def _leave_picker(self, message: TgMessage, manager: "Manager") -> None:
+    async def _leave_picker(self, message: TgMessage, manager: Manager) -> None:
         """Список групп/каналов MAX для выбора через кнопки (вызов /leave из General)."""
         async with self.storage._db.execute(
             "SELECT max_chat_id, thread_id, title FROM topics ORDER BY thread_id"
@@ -2090,7 +1944,7 @@ class Account:
             await message.reply("Нет подключённых чатов.")
             return
         buttons = []
-        for max_chat_id, thread_id, title in rows:
+        for max_chat_id, _thread_id, title in rows:
             chat = await self._get_chat(max_chat_id)
             chat_type = str(getattr(chat, "type", "") or "").upper()
             if chat_type == "DIALOG":
@@ -2109,7 +1963,7 @@ class Account:
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         )
 
-    async def confirm_leave(self, message: TgMessage, manager: "Manager") -> None:
+    async def confirm_leave(self, message: TgMessage, manager: Manager) -> None:
         """Показывает подтверждение выхода из MAX-канала/группы."""
         thread = message.message_thread_id
         if thread is None:
@@ -2168,7 +2022,6 @@ class Account:
         rows = []
         for cid in ids:
             title = await self._chat_title_by_id(cid)
-            thread = await self.storage.get_topic(cid)
             rows.append([InlineKeyboardButton(
                 text=f"🔔 Включить «{title}»",
                 callback_data=f"acc:unmute:{self.account_id}:{cid}",
@@ -2188,9 +2041,7 @@ class Account:
             )
             return
         text = message.text or message.caption or ""
-        # «//leave» — способ отправить в MAX команду, которую иначе перехватит мост.
-        if text.startswith("//"):
-            text = text[1:]
+        text = unescape_command(text)
         attachments = await self._collect_outgoing_media(message)
         if not text and not attachments:
             return
@@ -2281,6 +2132,8 @@ class Manager:
         # Кнопки ботов MAX: cb_id -> {account_id, chat_id, message_id, payload, text}
         self._cb_counter = 0
         self.pending_cb: dict[int, dict] = {}
+        # Фоновые задачи: держим ссылки, чтобы их не собрал GC.
+        self._followups: set[asyncio.Task] = set()
         # Антифлуд: попытки /add и кулдауны «тяжёлых» команд (по монотонным сек).
         self._add_times: dict[int, list[float]] = {}
         self._cmd_times: dict[tuple[int, str], float] = {}
@@ -2319,7 +2172,7 @@ class Manager:
             return (
                 "🚧 Лимит регистраций на час исчерпан. Попробуй позже."
             )
-        self._add_times[tg] = hist + [now]
+        self._add_times[tg] = [*hist, now]
         return None
 
     # ── ввод кода/пароля из диалога ───────────────────────────────────────
@@ -2329,7 +2182,9 @@ class Manager:
         fut: asyncio.Future = loop.create_future()
         prev = self.conv.get(tg_id)
         account_id = prev.account_id if prev else None
-        self.conv[tg_id] = Conv(step=step, account_id=account_id, future=fut)
+        await self._set_conv(
+            tg_id, Conv(step=step, account_id=account_id, future=fut)
+        )
         await self.bot.send_message(tg_id, prompt)
         try:
             return await asyncio.wait_for(fut, AUTH_TIMEOUT)
@@ -2343,6 +2198,11 @@ class Manager:
 
     def _session_name(self, acc: dict) -> str:
         return acc["session"] or f"acc_{acc['id']}.db"
+
+    def _secure_work_dir(self) -> None:
+        """Закрывает доступ к базам от других пользователей системы."""
+        for path in glob.glob(os.path.join(self.config.work_dir, "*.db")):
+            secure_file(path)
 
     def _mapping_db(self, acc: dict) -> str:
         return acc["mapping_db"] or os.path.join(
@@ -2402,7 +2262,7 @@ class Manager:
         await self.registry.set_status(account_id, "active")
         if account_id in self.pending_announce:
             self.pending_announce.discard(account_id)
-            self.conv.pop(worker.owner_tg_id, None)
+            await self._clear_conv(worker.owner_tg_id)
             if worker.group_id is None:
                 text = (
                     f"✅ Аккаунт «{worker.name}» вошёл в MAX!\n\n"
@@ -2418,7 +2278,10 @@ class Manager:
         if task.cancelled():
             return
         exc = task.exception()
-        asyncio.create_task(self._account_stopped(account_id, exc))
+        # Ссылку держим до конца: иначе задачу может собрать GC.
+        followup = asyncio.create_task(self._account_stopped(account_id, exc))
+        self._followups.add(followup)
+        followup.add_done_callback(self._followups.discard)
 
     async def _account_stopped(self, account_id: int, exc) -> None:
         acc = await self.registry.get(account_id)
@@ -2441,7 +2304,7 @@ class Manager:
         if not owner:
             return
         if onboarding:
-            self.conv.pop(owner, None)
+            await self._clear_conv(owner)
             text = (
                 f"❌ Вход в MAX не удался: {exc}\n\n"
                 "• Если ты в другой стране — задай прокси своего региона и "
@@ -2502,7 +2365,7 @@ class Manager:
     # ── Вспомогательные методы для кнопок ────────────────────────────────
 
     async def _send_accounts_list(
-        self, tg: int, dest: TgMessage | None = None, *, cb: "CallbackQuery | None" = None
+        self, tg: int, dest: TgMessage | None = None, *, cb: CallbackQuery | None = None
     ) -> None:
         accs = await self.registry.list_by_owner(tg)
         if not accs:
@@ -2519,8 +2382,22 @@ class Manager:
         lines = []
         for a in accs:
             grp = "✅" if a["group_id"] else "⚠️ нет группы"
-            online = "🟢" if a["id"] in self.workers else "⚪️"
-            lines.append(f"{online} #{a['id']} «{a['name']}» {a['phone']} — {grp}")
+            worker = self.workers.get(a["id"])
+            if worker is None:
+                online = "⚪️"
+                link_note = ""
+            elif worker.offline_since is not None:
+                online = "🔴"
+                link_note = " — нет связи с MAX"
+            else:
+                online = "🟢"
+                link_note = (
+                    f" — переподключений: {worker.reconnects}"
+                    if worker.reconnects else ""
+                )
+            lines.append(
+                f"{online} #{a['id']} «{a['name']}» {a['phone']} — {grp}{link_note}"
+            )
             rows.append([
                 InlineKeyboardButton(
                     text=f"🗑 Удалить #{a['id']}",
@@ -2642,7 +2519,7 @@ class Manager:
             if reason:
                 await message.answer(reason)
                 return
-            self.conv[tg] = Conv(step="phone")
+            await self._set_conv(tg, Conv(step="phone"))
             await message.answer(
                 "Пришли номер телефона MAX в международном формате, например "
                 "+79991234567"
@@ -2993,10 +2870,6 @@ class Manager:
 
     # ── админ-панель ──────────────────────────────────────────────────────
 
-    @staticmethod
-    def _mask_phone(phone: str) -> str:
-        return f"…{phone[-4:]}" if phone and len(phone) > 4 else (phone or "?")
-
     async def _admin_dashboard(self, message: TgMessage) -> None:
         accs = await self.registry.list_all()
         bans = await self.registry.list_bans()
@@ -3046,7 +2919,7 @@ class Manager:
             ]
             kb = InlineKeyboardMarkup(inline_keyboard=[row1])
             await message.answer(
-                f"{dot} #{aid} «{a['name']}» {self._mask_phone(a['phone'])} "
+                f"{dot} #{aid} «{a['name']}» {mask_phone(a['phone'])} "
                 f"— {grp} — {a['status']}\nOwner: {a['owner_tg_id']}",
                 reply_markup=kb,
             )
@@ -3075,7 +2948,7 @@ class Manager:
 
     async def _backup_now(self) -> str:
         return await asyncio.to_thread(
-            _build_backup,
+            build_backup,
             self.config.work_dir,
             self.config.backup_dir,
             self.config.backup_keep,
@@ -3100,7 +2973,7 @@ class Manager:
                     )
                 try:
                     archive_path = await asyncio.to_thread(
-                        _decrypt_file, archive_path, passphrase
+                        decrypt_file, archive_path, passphrase
                     )
                 except Exception:
                     await message.answer("❌ Неверный пароль — не удалось расшифровать.")
@@ -3122,7 +2995,7 @@ class Manager:
             # Восстанавливаем файлы
             await message.answer("📂 Восстанавливаю базы данных…")
             restored = await asyncio.to_thread(
-                _restore_backup, archive_path, self.config.work_dir
+                restore_backup, archive_path, self.config.work_dir
             )
 
         # Переоткрываем реестр
@@ -3151,6 +3024,124 @@ class Manager:
         )
         logger.info("Восстановление из бэкапа завершено. Файлы: %s", restored)
 
+    async def _set_conv(
+        self, tg: int, conv: Conv, phone: str | None = None
+    ) -> None:
+        """Запоминает шаг онбординга в памяти и в реестре."""
+        self.conv[tg] = conv
+        try:
+            await self.registry.save_conv(tg, conv.step, conv.account_id, phone)
+        except Exception:
+            logger.debug("Не сохранить состояние диалога %s", tg, exc_info=True)
+
+    async def _clear_conv(self, tg: int) -> None:
+        self.conv.pop(tg, None)
+        try:
+            await self.registry.drop_conv(tg)
+        except Exception:
+            logger.debug("Не удалить состояние диалога %s", tg, exc_info=True)
+
+    async def _resume_convs(self) -> None:
+        """Сообщает тем, чей онбординг оборвал перезапуск процесса.
+
+        Код из SMS живёт около двух минут, а сессия входа перезапуск не
+        переживает — поэтому продолжаем не молча, а с кнопкой «начать заново».
+        """
+        try:
+            convs = await self.registry.list_convs()
+        except Exception:
+            logger.debug("Не прочитать незавершённые диалоги", exc_info=True)
+            return
+        if not convs:
+            return
+        await self.registry.clear_convs()
+
+        for row in convs:
+            tg, step, phone = row["tg_id"], row["step"], row["phone"]
+            if step in ("login", "code", "password", "approved") and phone:
+                # Заявку уже одобряли — сразу даём кнопку повторного входа.
+                await self._set_conv(tg, Conv(step="approved"), phone=phone)
+                text = (
+                    "♻️ Бот перезапустился, и вход в MAX прервался.\n\n"
+                    "Нажми кнопку, когда будешь готов получить новый SMS-код."
+                )
+                markup = InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="📲 Получить SMS-код",
+                        callback_data=f"btn:startlogin:{phone}",
+                    ),
+                ]])
+            elif step == "waiting":
+                text = (
+                    "♻️ Бот перезапустился, и заявка на добавление аккаунта "
+                    "не сохранилась. Отправь /add ещё раз."
+                )
+                markup = None
+            else:
+                text = (
+                    "♻️ Бот перезапустился, добавление аккаунта прервалось. "
+                    "Начни заново — /add."
+                )
+                markup = None
+            try:
+                await self.bot.send_message(tg, text, reply_markup=markup)
+            except Exception:
+                logger.debug("Не уведомить %s о прерванном диалоге", tg,
+                             exc_info=True)
+        logger.info("Прерванных диалогов восстановлено: %d", len(convs))
+
+    async def _watchdog(self) -> None:
+        """Следит за связью аккаунтов с MAX и предупреждает владельцев."""
+        while True:
+            await asyncio.sleep(WATCHDOG_INTERVAL)
+            try:
+                await self._check_connections()
+            except Exception:
+                logger.debug("watchdog: проверка не удалась", exc_info=True)
+
+    async def _check_connections(self) -> None:
+        now = time.monotonic()
+        for worker in list(self.workers.values()):
+            if worker._max_online():
+                if worker.offline_since is None:
+                    continue
+                downtime = int(now - worker.offline_since)
+                worker.offline_since = None
+                worker.reconnects += 1
+                logger.info("[%s] связь с MAX восстановлена (%d сек офлайн)",
+                            worker.name, downtime)
+                if worker.offline_notified:
+                    worker.offline_notified = False
+                    await self._notify_owner(
+                        worker,
+                        f"🟢 Аккаунт «{worker.name}» снова на связи. "
+                        f"Не отвечал {max(1, downtime // 60)} мин — сообщения "
+                        "за это время могли не дойти.",
+                    )
+                continue
+
+            if worker.offline_since is None:
+                worker.offline_since = now
+                continue
+            offline_for = now - worker.offline_since
+            if not worker.offline_notified and offline_for >= OFFLINE_ALERT_SEC:
+                worker.offline_notified = True
+                logger.warning("[%s] нет связи с MAX уже %d сек",
+                               worker.name, int(offline_for))
+                await self._notify_owner(
+                    worker,
+                    f"🔴 Аккаунт «{worker.name}» потерял связь с MAX "
+                    f"{int(offline_for) // 60} мин назад. Переподключаемся; "
+                    "если не восстановится — попробуй /relogin.",
+                )
+
+    async def _notify_owner(self, worker: Account, text: str) -> None:
+        try:
+            await self.bot.send_message(worker.owner_tg_id, text)
+        except Exception:
+            logger.debug("Не доставить уведомление владельцу %s",
+                         worker.owner_tg_id, exc_info=True)
+
     async def _backup_loop(self) -> None:
         hours = self.config.backup_interval
         if hours <= 0:
@@ -3176,7 +3167,7 @@ class Manager:
         # сбросу сессий со стороны MAX (антифрод «два устройства»).
         existing = await self.registry.get_by_phone(phone)
         if existing is not None:
-            self.conv.pop(tg, None)
+            await self._clear_conv(tg)
             if existing["owner_tg_id"] == tg:
                 await message.reply(
                     f"У тебя уже есть аккаунт с этим номером — "
@@ -3193,7 +3184,7 @@ class Manager:
             await self._begin_login(tg, phone)
             return
         if not self.admin_ids:
-            self.conv.pop(tg, None)
+            await self._clear_conv(tg)
             await message.reply(
                 "Регистрация сейчас недоступна — не настроен администратор."
             )
@@ -3203,7 +3194,7 @@ class Manager:
         self._req_counter += 1
         req_id = self._req_counter
         self.pending_reqs[req_id] = {"requester": tg, "phone": phone}
-        self.conv[tg] = Conv(step="waiting")
+        await self._set_conv(tg, Conv(step="waiting"), phone=phone)
         await message.answer(
             "⏳ Заявка отправлена администратору. Как одобрит — пришлю запрос "
             "кода из SMS."
@@ -3236,7 +3227,9 @@ class Manager:
         account_id = await self.registry.add(
             requester_tg, name, phone, status="login"
         )
-        self.conv[requester_tg] = Conv(step="login", account_id=account_id)
+        await self._set_conv(
+            requester_tg, Conv(step="login", account_id=account_id), phone=phone
+        )
         self.pending_announce.add(account_id)
         await self.bot.send_message(
             requester_tg,
@@ -3300,13 +3293,10 @@ class Manager:
             )
 
         group_id = worker.group_id
-        topic_link = (
-            f"https://t.me/c/{str(group_id).lstrip('-100')}/{thread}"
-            if group_id else None
-        )
+        topic_url = topic_link(group_id, thread)
         kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="💬 Открыть тему", url=topic_link)
-        ]]) if topic_link else None
+            InlineKeyboardButton(text="💬 Открыть тему", url=topic_url)
+        ]]) if topic_url else None
         await cb.message.edit_text(
             f"✅ Чат с «{name}» создан!\n"
             f"Первое сообщение: «{send_text}»",
@@ -3490,7 +3480,7 @@ class Manager:
             if reason:
                 await cb.message.answer(reason)
                 return
-            self.conv[tg] = Conv(step="phone")
+            await self._set_conv(tg, Conv(step="phone"))
             await cb.message.answer(
                 "Пришли номер телефона MAX в международном формате, например +79991234567"
             )
@@ -3792,7 +3782,7 @@ class Manager:
             except Exception:
                 pass
             await cb.answer("Одобрено")
-            self.conv[requester] = Conv(step="approved")
+            await self._set_conv(requester, Conv(step="approved"), phone=phone)
             kb_user = InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(
                     text="📲 Получить SMS-код",
@@ -3810,7 +3800,7 @@ class Manager:
             except Exception:
                 pass
         else:
-            self.conv.pop(requester, None)
+            await self._clear_conv(requester)
             try:
                 await cb.message.edit_text(base + "\n\n❌ Отклонено")
             except Exception:
@@ -3846,13 +3836,16 @@ class Manager:
     async def run(self) -> None:
         self.http = aiohttp.ClientSession()
         self.registry = await Registry.create(self.config.registry_db)
+        self._secure_work_dir()
         await self._migrate_legacy()
 
         for acc in await self.registry.list_all():
             await self._start_account(acc["id"])
         logger.info("Поднято аккаунтов: %d", len(self.workers))
+        await self._resume_convs()
 
         backup_task = asyncio.create_task(self._backup_loop(), name="backup")
+        watchdog_task = asyncio.create_task(self._watchdog(), name="watchdog")
 
         try:
             # allowed_updates с message_reaction — иначе Telegram не шлёт
@@ -3863,10 +3856,12 @@ class Manager:
             )
         finally:
             backup_task.cancel()
+            watchdog_task.cancel()
             for task in list(self.tasks.values()):
                 task.cancel()
             await asyncio.gather(
-                backup_task, *self.tasks.values(), return_exceptions=True
+                backup_task, watchdog_task, *self.tasks.values(),
+                return_exceptions=True,
             )
             await self.http.close()
             for worker in self.workers.values():
@@ -3879,6 +3874,9 @@ class Manager:
 
 
 async def main() -> None:
+    # Сессии MAX дают полный доступ к аккаунту пользователя, а базы содержат
+    # переписку: всё, что создаст процесс, должно быть доступно только ему.
+    os.umask(0o077)
     config = Config.load()
     logger.info("Запуск мультитенантного моста MAX <-> Telegram…")
     manager = Manager(config)
