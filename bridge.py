@@ -168,6 +168,10 @@ _OP_MSG_SEND_CALLBACK = 118
 AUTH_TIMEOUT = 300  # сек на ввод кода/пароля
 WATCHDOG_INTERVAL = 30  # как часто проверяем связь аккаунтов с MAX
 OFFLINE_ALERT_SEC = 300  # через сколько молчания предупредить владельца
+OFFLINE_RESTART_SEC = 180  # через сколько молчания перезапускать аккаунт
+# Паузы между попытками поднять упавший аккаунт (последняя повторяется).
+REVIVE_DELAYS = (15, 30, 60, 300, 900)
+REVIVE_ATTEMPTS = 6  # после стольких неудач зовём владельца на /relogin
 
 
 async def _retry_after_middleware(make_request, bot, method):
@@ -254,6 +258,7 @@ class Account:
         # Наблюдение за связью с MAX (см. Manager._check_connections).
         self.offline_since: float | None = None
         self.offline_notified = False
+        self.restart_tried = False
         self.reconnects = 0
         # Клавиатуры, висящие на сообщениях TG: (chat_id, msg_id) -> markup.
         # Нужны, чтобы правка сообщения не сбрасывала кнопки.
@@ -2134,6 +2139,9 @@ class Manager:
         self.pending_cb: dict[int, dict] = {}
         # Фоновые задачи: держим ссылки, чтобы их не собрал GC.
         self._followups: set[asyncio.Task] = set()
+        # Автоподъём упавших аккаунтов: задачи и те, о ком уже писали владельцу.
+        self._revive_tasks: dict[int, asyncio.Task] = {}
+        self._down_notified: set[int] = set()
         # Антифлуд: попытки /add и кулдауны «тяжёлых» команд (по монотонным сек).
         self._add_times: dict[int, list[float]] = {}
         self._cmd_times: dict[tuple[int, str], float] = {}
@@ -2260,6 +2268,11 @@ class Manager:
         if worker is None:
             return
         await self.registry.set_status(account_id, "active")
+        if account_id in self._down_notified:
+            self._down_notified.discard(account_id)
+            await self._notify_owner(
+                worker, f"🟢 Аккаунт «{worker.name}» снова в строю."
+            )
         if account_id in self.pending_announce:
             self.pending_announce.discard(account_id)
             await self._clear_conv(worker.owner_tg_id)
@@ -2314,16 +2327,84 @@ class Manager:
                 f"• Или удали заявку: /remove {account_id}"
             )
         else:
-            logger.error("Аккаунт '%s' остановился: %r", name, exc)
-            text = (
-                f"⚠️ Аккаунт «{name}» остановился (возможно, MAX сбросил "
-                f"сессию). Перезапустить вход: /relogin {account_id} "
-                f"(или удалить: /remove {account_id})."
-            )
+            # Обрыв связи с MAX — обычное дело; поднимаем сами и молчим,
+            # пока попытки не исчерпаны.
+            logger.warning("Аккаунт '%s' остановился: %r — поднимаем", name, exc)
+            self._schedule_revive(account_id)
+            return
         try:
             await self.bot.send_message(owner, text)
         except Exception:
             pass
+
+    def _schedule_revive(self, account_id: int) -> None:
+        """Ставит в очередь автоподъём аккаунта, если он ещё не запущен."""
+        task = self._revive_tasks.get(account_id)
+        if task is not None and not task.done():
+            return
+        task = asyncio.create_task(
+            self._revive_account(account_id), name=f"revive-{account_id}"
+        )
+        self._revive_tasks[account_id] = task
+        task.add_done_callback(
+            lambda t, aid=account_id: self._revive_tasks.pop(aid, None)
+        )
+
+    async def _revive_account(self, account_id: int) -> None:
+        """Поднимает упавший аккаунт с нарастающими паузами.
+
+        PyMax переподключается сам, но после «marking app as stopped» его
+        задача завершается — и без этого цикла аккаунт лежит до ручного
+        /relogin.
+        """
+        for attempt in range(1, REVIVE_ATTEMPTS + 1):
+            delay = REVIVE_DELAYS[min(attempt - 1, len(REVIVE_DELAYS) - 1)]
+            await asyncio.sleep(delay)
+
+            acc = await self.registry.get(account_id)
+            if acc is None:
+                return  # аккаунт удалили, пока мы ждали
+            if account_id in self.workers:
+                return  # подняли другим путём (/relogin)
+
+            logger.info("Попытка %d/%d поднять аккаунт #%s",
+                        attempt, REVIVE_ATTEMPTS, account_id)
+            try:
+                await self._start_account(account_id)
+            except Exception:
+                logger.warning("Попытка %d поднять #%s не удалась",
+                               attempt, account_id, exc_info=True)
+                continue
+
+            # Клиент стартует не мгновенно — даём ему подключиться.
+            for _ in range(20):
+                await asyncio.sleep(3)
+                worker = self.workers.get(account_id)
+                if worker is not None and worker._max_online():
+                    logger.info("Аккаунт #%s поднят с попытки %d",
+                                account_id, attempt)
+                    return
+            await self._cleanup_account(account_id, delete=False)
+
+        acc = await self.registry.get(account_id)
+        if acc is None or account_id in self.workers:
+            return
+        logger.error("Аккаунт #%s поднять не удалось", account_id)
+        self._down_notified.add(account_id)
+        owner = acc["owner_tg_id"]
+        name = acc["name"] or f"MAX {account_id}"
+        try:
+            await self.bot.send_message(
+                owner,
+                f"🔴 Аккаунт «{name}» не удалось вернуть в строй — MAX не "
+                f"отвечает или сбросил сессию.\n\n"
+                f"Попробуй войти заново: /relogin {account_id}\n"
+                f"Если ты в другой стране — сначала задай прокси: "
+                f"/setproxy {account_id} http://user:pass@ip:port",
+            )
+        except Exception:
+            logger.debug("Не доставить сообщение владельцу %s", owner,
+                         exc_info=True)
 
     async def _restart_account(self, account_id: int, *, announce: bool) -> None:
         """Останавливает и заново запускает аккаунт (после смены прокси и т.п.)."""
@@ -2333,6 +2414,11 @@ class Manager:
         await self._start_account(account_id)
 
     async def _cleanup_account(self, account_id: int, *, delete: bool) -> None:
+        if delete:
+            revive = self._revive_tasks.pop(account_id, None)
+            if revive is not None and not revive.done():
+                revive.cancel()
+            self._down_notified.discard(account_id)
         task = self.tasks.pop(account_id, None)
         if task and not task.done():
             task.cancel()
@@ -3107,6 +3193,7 @@ class Manager:
                     continue
                 downtime = int(now - worker.offline_since)
                 worker.offline_since = None
+                worker.restart_tried = False
                 worker.reconnects += 1
                 logger.info("[%s] связь с MAX восстановлена (%d сек офлайн)",
                             worker.name, downtime)
@@ -3124,6 +3211,13 @@ class Manager:
                 worker.offline_since = now
                 continue
             offline_for = now - worker.offline_since
+            if offline_for >= OFFLINE_RESTART_SEC and not worker.restart_tried:
+                # Клиент жив, но связи нет — поднимаем принудительно.
+                worker.restart_tried = True
+                logger.warning("[%s] нет связи %d сек — перезапускаю аккаунт",
+                               worker.name, int(offline_for))
+                self._schedule_restart(worker.account_id)
+                continue
             if not worker.offline_notified and offline_for >= OFFLINE_ALERT_SEC:
                 worker.offline_notified = True
                 logger.warning("[%s] нет связи с MAX уже %d сек",
@@ -3134,6 +3228,14 @@ class Manager:
                     f"{int(offline_for) // 60} мин назад. Переподключаемся; "
                     "если не восстановится — попробуй /relogin.",
                 )
+
+    def _schedule_restart(self, account_id: int) -> None:
+        task = asyncio.create_task(
+            self._restart_account(account_id, announce=False),
+            name=f"watchdog-restart-{account_id}",
+        )
+        self._followups.add(task)
+        task.add_done_callback(self._followups.discard)
 
     async def _notify_owner(self, worker: Account, text: str) -> None:
         try:
