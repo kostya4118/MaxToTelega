@@ -19,7 +19,7 @@ class Registry:
         self._db: aiosqlite.Connection | None = None
 
     @classmethod
-    async def create(cls, db_path: str) -> "Registry":
+    async def create(cls, db_path: str) -> Registry:
         self = cls(db_path)
         self._db = await aiosqlite.connect(db_path)
         self._db.row_factory = aiosqlite.Row
@@ -43,8 +43,53 @@ class Registry:
             "CREATE TABLE IF NOT EXISTS bans ("
             "tg_id INTEGER PRIMARY KEY, created_at INTEGER NOT NULL)"
         )
+        # Незавершённые диалоги онбординга: переживают перезапуск процесса,
+        # чтобы пользователь не остался ждать ответа, которого не будет.
+        await self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS conversations (
+                tg_id      INTEGER PRIMARY KEY,
+                step       TEXT NOT NULL,
+                account_id INTEGER,
+                phone      TEXT,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
         await self._db.commit()
         return self
+
+    # ── незавершённые диалоги ────────────────────────────────────────────
+
+    async def save_conv(
+        self,
+        tg_id: int,
+        step: str,
+        account_id: int | None = None,
+        phone: str | None = None,
+    ) -> None:
+        await self._db.execute(
+            "INSERT INTO conversations (tg_id, step, account_id, phone, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT(tg_id) DO UPDATE SET "
+            "step=excluded.step, account_id=excluded.account_id, "
+            "phone=excluded.phone, updated_at=excluded.updated_at",
+            (tg_id, step, account_id, phone, int(time.time())),
+        )
+        await self._db.commit()
+
+    async def drop_conv(self, tg_id: int) -> None:
+        await self._db.execute("DELETE FROM conversations WHERE tg_id = ?", (tg_id,))
+        await self._db.commit()
+
+    async def list_convs(self) -> list[dict[str, Any]]:
+        async with self._db.execute(
+            "SELECT * FROM conversations ORDER BY updated_at"
+        ) as cur:
+            return [dict(row) for row in await cur.fetchall()]
+
+    async def clear_convs(self) -> None:
+        await self._db.execute("DELETE FROM conversations")
+        await self._db.commit()
 
     # ── баны ─────────────────────────────────────────────────────────────
 

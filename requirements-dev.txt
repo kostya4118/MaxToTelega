@@ -1,0 +1,5 @@
+# Инструменты разработки: линтер и тесты (в проде не нужны).
+-r requirements.txt
+ruff>=0.6
+pytest>=8.0
+pytest-asyncio>=0.24

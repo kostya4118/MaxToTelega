@@ -1,0 +1,36 @@
+[project]
+name = "maxtotelega"
+version = "1.1.0"
+description = "Мост между мессенджером MAX и Telegram"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "W",    # warnings
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "C4",   # comprehensions
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",    # длину строк держим на глаз, не ломая сообщения пользователю
+    "B008",    # вызовы в аргументах по умолчанию — обычное дело для aiogram
+    "RUF001",  # кириллица рядом с латиницей в строках — это норма для проекта
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B017"]  # pytest.raises(Exception) в тестах допустим

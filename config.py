@@ -40,7 +40,7 @@ class Config:
     legacy_proxy: str | None
 
     @classmethod
-    def load(cls) -> "Config":
+    def load(cls) -> Config:
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         if not token:
             raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в .env")
