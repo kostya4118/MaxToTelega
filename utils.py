@@ -172,3 +172,31 @@ def username_from_link(link: str) -> str:
 
     path = urlparse(link).path if "//" in link else link
     return path.strip("/").split("/")[-1].lstrip("@")
+
+
+# Служебные события MAX (ControlAttachment.event). Набор кодов недокументирован,
+# поэтому незнакомые показываем как есть и пишем в лог — так их видно и можно
+# добавить сюда позже.
+CONTROL_EVENT_TEXTS = {
+    "new": "чат создан",
+    "add": "участники добавлены",
+    "remove": "участник удалён",
+    "leave": "участник вышел",
+    "join": "участник вступил",
+    "title": "название чата изменено",
+    "icon": "иконка чата изменена",
+    "pin": "сообщение закреплено",
+    "unpin": "закрепление снято",
+    "call": "звонок",
+    "hangup": "звонок завершён",
+    "system": "системное сообщение",
+}
+
+
+def describe_control_event(event: str) -> str:
+    """Человекочитаемое описание служебного события MAX."""
+    key = (event or "").strip().lower()
+    known = CONTROL_EVENT_TEXTS.get(key)
+    if known:
+        return known
+    return f"служебное событие «{event}»" if event else "системное сообщение"
