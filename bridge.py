@@ -3728,7 +3728,9 @@ class Manager:
             ]])
         try:
             with open(subs_file, "w") as f:
-                f.write("\n".join(sorted(lines)))
+                # Каждый id — со своим переводом строки: без него `while read`
+                # во внешнем скрипте ротации пропускает последнюю запись.
+                f.write("".join(f"{line}\n" for line in sorted(lines)))
         except Exception as e:
             await cb.message.answer(f"⚠️ Ошибка: {e}")
             return
