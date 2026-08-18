@@ -3706,6 +3706,16 @@ class Manager:
         else:
             await cb.answer()
 
+    def _proxy_link(self) -> str | None:
+        """Последняя ссылка на прокси, записанная скриптом ротации."""
+        path = os.path.join(self.config.work_dir, "proxy_link.txt")
+        try:
+            with open(path) as f:
+                return f.read().strip() or None
+        except OSError:
+            logger.debug("Нет файла со ссылкой на прокси: %s", path)
+            return None
+
     async def _proxy_toggle(self, tg: int, cb, subscribe: bool) -> None:
         subs_file = os.path.join(self.config.work_dir, "proxy_subscribers.txt")
         try:
@@ -3716,7 +3726,17 @@ class Manager:
         tg_str = str(tg)
         if subscribe:
             lines.add(tg_str)
-            msg = "\u2705 Подписан! Новая ссылка придёт автоматически при обновлении прокси."
+            link = self._proxy_link()
+            if link:
+                msg = (
+                    "\u2705 Подписан!\n\nТекущая ссылка:\n"
+                    f"{link}\n\nНовая придёт автоматически при обновлении."
+                )
+            else:
+                msg = (
+                    "\u2705 Подписан! Ссылка придёт автоматически при "
+                    "обновлении прокси."
+                )
             kb = InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="\U0001f515 Отписаться", callback_data="btn:proxy_unsub"),
             ]])
