@@ -2,6 +2,7 @@ import pytest
 
 from utils import (
     MAX_LINK_RE,
+    describe_control_event,
     is_bot_contact,
     mask_phone,
     normalize_phone,
@@ -168,3 +169,19 @@ class TestMisc:
 
     def test_link_regex_ignores_other_hosts(self):
         assert MAX_LINK_RE.search("https://example.com/max.ru") is None
+
+
+class TestControlEvents:
+    def test_known_event(self):
+        assert describe_control_event("leave") == "участник вышел"
+
+    def test_case_insensitive(self):
+        assert describe_control_event("LEAVE") == "участник вышел"
+
+    def test_unknown_event_is_shown_as_is(self):
+        # Набор кодов недокументирован: незнакомое событие должно быть видно.
+        assert describe_control_event("pin_v2") == "служебное событие «pin_v2»"
+
+    @pytest.mark.parametrize("event", ["", None])
+    def test_empty_event(self, event):
+        assert describe_control_event(event) == "системное сообщение"

@@ -74,10 +74,12 @@ from config import Config
 from registry import Registry
 from storage import Storage
 from utils import (
+    CONTROL_EVENT_TEXTS,
     MAX_LINK_RE,
     PHONE_RE,
     TG_CAPTION_LIMIT,
     TG_UPLOAD_LIMIT,
+    describe_control_event,
     is_bot_contact,
     looks_like_phone,
     mask_phone,
@@ -254,6 +256,7 @@ class Account:
         self._seen_opcodes: set[int] = set()
         self._last_chat_reaction: tuple | None = None
         self._diag_attaches: set[str] = set()
+        self._diag_controls: set[str] = set()
         self._diag_kb = False
         # Наблюдение за связью с MAX (см. Manager._check_connections).
         self.offline_since: float | None = None
@@ -964,7 +967,7 @@ class Account:
                 elif isinstance(attach, CallAttachment):
                     notes.append("📞 звонок")
                 elif isinstance(attach, ControlAttachment):
-                    notes.append("ℹ️ системное сообщение")
+                    notes.append(await self._describe_control(attach))
                 elif isinstance(getattr(attach, "keyboard", None), dict):
                     pass  # клавиатуру рисуем кнопками, а не текстом
                 else:
@@ -1131,6 +1134,26 @@ class Account:
                 logger.info("[%s] callback keys=%s не прошёл: %s",
                             self.name, sorted(variant), e)
         return f"{type(last_error).__name__}: {last_error}"
+
+    async def _describe_control(self, attach) -> str:
+        """Расшифровывает служебное событие MAX (вступил, вышел, закрепил…)."""
+        event = str(getattr(attach, "event", "") or "")
+        extra = getattr(attach, "model_extra", None) or {}
+        if event.lower() not in CONTROL_EVENT_TEXTS and event not in self._diag_controls:
+            self._diag_controls.add(event)
+            logger.info("[%s] неизвестное служебное событие %r: %r",
+                        self.name, event, str(extra)[:500])
+
+        text = describe_control_event(event)
+        ids = extra.get("userIds") or extra.get("user_ids") or []
+        names = [
+            await self._user_name(uid)
+            for uid in list(ids)[:5]
+            if isinstance(uid, int)
+        ]
+        if names:
+            text = f"{text}: {', '.join(names)}"
+        return f"ℹ️ {text}"
 
     def _diag_attach(self, attach) -> None:
         """Один раз на тип логирует сырое вложение — чтобы отрисовать его потом."""
