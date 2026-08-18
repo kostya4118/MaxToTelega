@@ -85,6 +85,8 @@ from utils import (
     mask_phone,
     parse_general_query,
     parse_max_keyboard,
+    parse_proxy_link,
+    tg_proxy_web_link,
     topic_link,
     unescape_command,
     username_from_link,
@@ -3707,14 +3709,23 @@ class Manager:
             await cb.answer()
 
     def _proxy_link(self) -> str | None:
-        """Последняя ссылка на прокси, записанная скриптом ротации."""
-        path = os.path.join(self.config.work_dir, "proxy_link.txt")
-        try:
-            with open(path) as f:
-                return f.read().strip() or None
-        except OSError:
-            logger.debug("Нет файла со ссылкой на прокси: %s", path)
-            return None
+        """Последняя ссылка на прокси от скрипта ротации.
+
+        Берём либо файл с одной ссылкой, либо копию конфига mtproxy —
+        что из этого положат рядом с базами.
+        """
+        for name in ("proxy_link.txt", "mtproto_config.txt"):
+            path = os.path.join(self.config.work_dir, name)
+            try:
+                with open(path) as f:
+                    content = f.read()
+            except OSError:
+                continue
+            link = parse_proxy_link(content)
+            if link:
+                return link
+        logger.debug("Ссылка на прокси не найдена в %s", self.config.work_dir)
+        return None
 
     async def _proxy_toggle(self, tg: int, cb, subscribe: bool) -> None:
         subs_file = os.path.join(self.config.work_dir, "proxy_subscribers.txt")
@@ -3728,10 +3739,13 @@ class Manager:
             lines.add(tg_str)
             link = self._proxy_link()
             if link:
-                msg = (
-                    "\u2705 Подписан!\n\nТекущая ссылка:\n"
-                    f"{link}\n\nНовая придёт автоматически при обновлении."
-                )
+                # tg:// кликается не во всех клиентах — даём и https-вариант.
+                web = tg_proxy_web_link(link)
+                lines_out = ["\u2705 Подписан!", "", "Текущая ссылка:", link]
+                if web:
+                    lines_out += ["", "Если не открылась, нажми эту:", web]
+                lines_out += ["", "Новая придёт автоматически при обновлении."]
+                msg = "\n".join(lines_out)
             else:
                 msg = (
                     "\u2705 Подписан! Ссылка придёт автоматически при "

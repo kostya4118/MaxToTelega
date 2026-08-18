@@ -8,6 +8,8 @@ from utils import (
     normalize_phone,
     parse_general_query,
     parse_max_keyboard,
+    parse_proxy_link,
+    tg_proxy_web_link,
     topic_link,
     unescape_command,
     username_from_link,
@@ -185,3 +187,46 @@ class TestControlEvents:
     @pytest.mark.parametrize("event", ["", None])
     def test_empty_event(self, event):
         assert describe_control_event(event) == "системное сообщение"
+
+
+class TestProxyLink:
+    CONFIG = (
+        "SERVER=194.87.245.163\n"
+        "ACTIVE_SLOT=c\n"
+        "PORT=4517\n"
+        "SECRET=eeb66d86a57ddf4b8\n"
+        "LINK=tg://proxy?server=194.87.245.163&port=4517&secret=eeb66d86\n"
+        "LINK_A=tg://proxy?server=194.87.245.163&port=4515&secret=ee8fb558\n"
+    )
+
+    def test_reads_link_from_config(self):
+        # Именно LINK, а не LINK_A из следующей строки.
+        assert parse_proxy_link(self.CONFIG) == (
+            "tg://proxy?server=194.87.245.163&port=4517&secret=eeb66d86"
+        )
+
+    def test_reads_bare_link(self):
+        link = "tg://proxy?server=1.2.3.4&port=443&secret=ee00"
+        assert parse_proxy_link(f"\n{link}\n") == link
+
+    def test_reads_bare_web_link(self):
+        link = "https://t.me/proxy?server=1.2.3.4&port=443&secret=ee00"
+        assert parse_proxy_link(link) == link
+
+    def test_strips_quotes(self):
+        assert parse_proxy_link('LINK="tg://proxy?x=1"') == "tg://proxy?x=1"
+
+    @pytest.mark.parametrize("content", ["", "   ", "SERVER=1.2.3.4\nPORT=443"])
+    def test_no_link(self, content):
+        assert parse_proxy_link(content) is None
+
+    def test_web_variant(self):
+        assert tg_proxy_web_link("tg://proxy?server=1.2.3.4") == (
+            "https://t.me/proxy?server=1.2.3.4"
+        )
+
+    @pytest.mark.parametrize("link", [
+        "https://t.me/proxy?server=1.2.3.4", "", "не ссылка",
+    ])
+    def test_web_variant_only_for_tg_scheme(self, link):
+        assert tg_proxy_web_link(link) is None

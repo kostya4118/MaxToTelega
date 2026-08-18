@@ -200,3 +200,32 @@ def describe_control_event(event: str) -> str:
     if known:
         return known
     return f"служебное событие «{event}»" if event else "системное сообщение"
+
+
+def parse_proxy_link(content: str) -> str | None:
+    """Достаёт ссылку на MTProto-прокси из файла.
+
+    Понимает и «голую» ссылку в файле, и конфиг вида KEY=VALUE, где нужное
+    значение лежит в LINK (так его пишет скрипт ротации).
+    """
+    if not content:
+        return None
+    for line in content.splitlines():
+        line = line.strip()
+        if line.startswith("LINK="):
+            value = line[len("LINK="):].strip().strip('"\'')
+            if value:
+                return value
+    for line in content.splitlines():
+        line = line.strip()
+        if line.startswith(("tg://proxy", "https://t.me/proxy")):
+            return line
+    return None
+
+
+def tg_proxy_web_link(link: str) -> str | None:
+    """Превращает tg://proxy?… в https://t.me/proxy?… — такая ссылка кликается везде."""
+    prefix = "tg://proxy?"
+    if link and link.startswith(prefix):
+        return "https://t.me/proxy?" + link[len(prefix):]
+    return None
