@@ -2540,6 +2540,9 @@ class Manager:
                 [
                     InlineKeyboardButton(text="ℹ️ Справка", callback_data="btn:help"),
                 ],
+                [
+                    InlineKeyboardButton(text="📡 MTProto прокси", callback_data="btn:proxy_sub"),
+                ],
             ])
             await message.answer(
                 "Привет! Я зеркалю переписку MAX в Telegram.\n\n"
@@ -3696,8 +3699,40 @@ class Manager:
             await cb.answer("Перезапускаю…")
             await self._restart_account(account_id, announce=True)
 
+        elif action in ("proxy_sub", "proxy_unsub"):
+            await cb.answer()
+            await self._proxy_toggle(tg, cb, subscribe=(action == "proxy_sub"))
+
         else:
             await cb.answer()
+
+    async def _proxy_toggle(self, tg: int, cb, subscribe: bool) -> None:
+        subs_file = "/root/proxy_subscribers.txt"
+        try:
+            with open(subs_file) as f:
+                lines = {line.strip() for line in f if line.strip()}
+        except FileNotFoundError:
+            lines = set()
+        tg_str = str(tg)
+        if subscribe:
+            lines.add(tg_str)
+            msg = "\u2705 Подписан! Новая ссылка придёт автоматически при обновлении прокси."
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="\U0001f515 Отписаться", callback_data="btn:proxy_unsub"),
+            ]])
+        else:
+            lines.discard(tg_str)
+            msg = "Ты отписан от обновлений прокси."
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="\U0001f4e1 Подписаться снова", callback_data="btn:proxy_sub"),
+            ]])
+        try:
+            with open(subs_file, "w") as f:
+                f.write("\n".join(sorted(lines)))
+        except Exception as e:
+            await cb.message.answer(f"⚠️ Ошибка: {e}")
+            return
+        await cb.message.answer(msg, reply_markup=kb)
 
     async def _handle_adm(self, cb: CallbackQuery) -> None:
         """Кнопки админ-панели: adm:list, adm:banned, adm:backup, adm:stop:N, adm:start:N, adm:remove:N."""
