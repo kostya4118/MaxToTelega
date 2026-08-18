@@ -3707,7 +3707,7 @@ class Manager:
             await cb.answer()
 
     async def _proxy_toggle(self, tg: int, cb, subscribe: bool) -> None:
-        subs_file = "/root/proxy_subscribers.txt"
+        subs_file = os.path.join(self.config.work_dir, "proxy_subscribers.txt")
         try:
             with open(subs_file) as f:
                 lines = {line.strip() for line in f if line.strip()}
