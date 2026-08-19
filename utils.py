@@ -231,18 +231,39 @@ def tg_proxy_web_link(link: str) -> str | None:
     return None
 
 
-# Признаки того, что MAX отозвал сессию: переподключение тут не поможет,
-# нужен новый вход по SMS.
-_AUTH_ERROR_MARKERS = (
+# Ошибки, которые не лечатся перезапуском: нужен ручной вход или обновление.
+_TOKEN_MARKERS = (
     "login.token",
     "fail_login_token",
     "auth.token",
     "not.authorized",
     "unauthorized",
 )
+_CODE_MARKERS = (
+    "attempt.limit",
+    "code.expired",
+    "code.wrong",
+    "code.attempt",
+    "password2fa",
+)
+_VERSION_MARKERS = (
+    "unsupported-version",
+    "unsupported client version",
+)
 
 
-def is_auth_error(exc: object) -> bool:
-    """Отличает «сессия недействительна» от обычного обрыва связи."""
+def login_failure_reason(exc: object) -> str | None:
+    """Классифицирует отказ входа в MAX.
+
+    Возвращает «version» (клиент устарел), «token» (сессия отозвана),
+    «code» (код или пароль не подошли) либо None для обычных сетевых сбоев,
+    которые лечатся переподключением.
+    """
     text = str(exc or "").lower()
-    return any(marker in text for marker in _AUTH_ERROR_MARKERS)
+    if any(marker in text for marker in _VERSION_MARKERS):
+        return "version"
+    if any(marker in text for marker in _TOKEN_MARKERS):
+        return "token"
+    if any(marker in text for marker in _CODE_MARKERS):
+        return "code"
+    return None

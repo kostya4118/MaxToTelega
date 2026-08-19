@@ -80,8 +80,8 @@ from utils import (
     TG_CAPTION_LIMIT,
     TG_UPLOAD_LIMIT,
     describe_control_event,
-    is_auth_error,
     is_bot_contact,
+    login_failure_reason,
     looks_like_phone,
     mask_phone,
     parse_general_query,
@@ -2356,10 +2356,11 @@ class Manager:
                 f"   /relogin {account_id}\n"
                 f"• Или удали заявку: /remove {account_id}"
             )
-        elif is_auth_error(exc):
-            # Сессия недействительна — перезапуск её не воскресит.
-            logger.error("Аккаунт '%s': MAX отозвал сессию (%r)", name, exc)
-            await self._require_relogin(account_id, name, owner)
+        elif login_failure_reason(exc):
+            # Вход не удался: перезапуск это не чинит, нужен человек.
+            reason = login_failure_reason(exc)
+            logger.error("Аккаунт '%s': вход не удался (%s): %r", name, reason, exc)
+            await self._require_relogin(account_id, name, owner, reason)
             return
         else:
             # Обрыв связи с MAX — обычное дело; поднимаем сами и молчим,
@@ -2372,8 +2373,23 @@ class Manager:
         except Exception:
             pass
 
-    async def _require_relogin(self, account_id: int, name: str, owner: int) -> None:
-        """Останавливает автоподъём и зовёт владельца войти заново по SMS."""
+    def _login_in_progress(self, account_id: int) -> bool:
+        """Идёт ли сейчас вход: ждём код из SMS или 2FA-пароль.
+
+        В это время клиент ещё не онлайн, но трогать его нельзя — перезапуск
+        обнуляет логин, и код из SMS протухает.
+        """
+        if account_id in self.pending_announce:
+            return True
+        worker = self.workers.get(account_id)
+        owner = worker.owner_tg_id if worker else None
+        conv = self.conv.get(owner) if owner else None
+        return conv is not None and conv.step in ("login", "code", "password")
+
+    async def _require_relogin(
+        self, account_id: int, name: str, owner: int, reason: str
+    ) -> None:
+        """Останавливает автоподъём и объясняет владельцу, что делать."""
         self._needs_relogin.add(account_id)
         revive = self._revive_tasks.pop(account_id, None)
         if revive is not None and not revive.done():
@@ -2382,20 +2398,40 @@ class Manager:
         if not owner or account_id in self._auth_notified:
             return
         self._auth_notified.add(account_id)
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text="📲 Войти заново по SMS",
-                callback_data=f"btn:resession:{account_id}",
-            ),
-        ]])
+
+        if reason == "version":
+            # Обновление ставится на сервере, кнопка тут не поможет.
+            text = (
+                f"⚠️ MAX больше не пускает аккаунт «{name}»: клиент устарел.\n\n"
+                "Нужно обновить библиотеку на сервере:\n"
+                "<code>.venv/bin/pip install -U maxapi-python</code>\n"
+                "и перезапустить бота."
+            )
+            kb = None
+        else:
+            if reason == "code":
+                text = (
+                    f"📲 Вход в аккаунт «{name}» не завершился: код из SMS "
+                    "не подошёл или устарел.\n\n"
+                    "Код живёт около двух минут — нажми кнопку, когда будешь "
+                    "готов ввести новый сразу."
+                )
+            else:
+                text = (
+                    f"🔐 MAX разлогинил аккаунт «{name}» — сессия больше "
+                    "недействительна.\n\n"
+                    "Сообщения не приходят, пока не войдёшь заново. Нажми "
+                    "кнопку, когда будешь готов принять SMS-код."
+                )
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="📲 Войти заново по SMS",
+                    callback_data=f"btn:resession:{account_id}",
+                ),
+            ]])
         try:
             await self.bot.send_message(
-                owner,
-                f"🔐 MAX разлогинил аккаунт «{name}» — сессия больше "
-                "недействительна.\n\n"
-                "Сообщения не приходят, пока не войдёшь заново. Нажми кнопку, "
-                "когда будешь готов принять SMS-код (он живёт около двух минут).",
-                reply_markup=kb,
+                owner, text, reply_markup=kb, parse_mode="HTML"
             )
         except Exception:
             logger.debug("Не доставить сообщение владельцу %s", owner, exc_info=True)
@@ -2453,6 +2489,8 @@ class Manager:
                 return  # подняли другим путём (/relogin)
             if account_id in self._needs_relogin:
                 return  # ждём входа по SMS, поднимать бессмысленно
+            if self._login_in_progress(account_id):
+                return  # человек как раз вводит код
 
             logger.info("Попытка %d/%d поднять аккаунт #%s",
                         attempt, REVIVE_ATTEMPTS, account_id)
@@ -3289,6 +3327,8 @@ class Manager:
         now = time.monotonic()
         for worker in list(self.workers.values()):
             if worker.account_id in self._needs_relogin:
+                continue
+            if self._login_in_progress(worker.account_id):
                 continue
             if worker._max_online():
                 if worker.offline_since is None:

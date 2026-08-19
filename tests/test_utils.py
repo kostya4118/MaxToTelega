@@ -3,8 +3,8 @@ import pytest
 from utils import (
     MAX_LINK_RE,
     describe_control_event,
-    is_auth_error,
     is_bot_contact,
+    login_failure_reason,
     mask_phone,
     normalize_phone,
     parse_general_query,
@@ -233,14 +233,19 @@ class TestProxyLink:
         assert tg_proxy_web_link(link) is None
 
 
-class TestAuthError:
-    def test_detects_fail_login_token(self):
-        # Ровно то, что MAX присылает после отзыва сессии.
-        exc = (
-            "Ошибка входа. Пожалуйста, авторизируйтесь снова FAIL_LOGIN_TOKEN "
-            "(Ошибка входа) [login.token]"
-        )
-        assert is_auth_error(exc) is True
+class TestLoginFailureReason:
+    @pytest.mark.parametrize("exc,expected", [
+        # Сессию отозвали — нужен вход заново.
+        ("Ошибка входа FAIL_LOGIN_TOKEN [login.token]", "token"),
+        # Клиент устарел — не лечится ни входом, ни перезапуском.
+        ("Приложение устарело Unsupported client version "
+         "[client.unsupported-version]", "version"),
+        # Код или пароль не подошли — нужен новый код.
+        ("Этот код устарел, получите новый [error.code.attempt.limit]", "code"),
+        ("Неверный пароль password wrong [password2fa.wrong]", "code"),
+    ])
+    def test_classifies_login_failures(self, exc, expected):
+        assert login_failure_reason(exc) == expected
 
     @pytest.mark.parametrize("exc", [
         "Connection closed by the server",
@@ -249,5 +254,6 @@ class TestAuthError:
         "",
         None,
     ])
-    def test_network_errors_are_not_auth(self, exc):
-        assert is_auth_error(exc) is False
+    def test_network_errors_are_not_login_failures(self, exc):
+        # Такое лечится переподключением, вмешательство человека не нужно.
+        assert login_failure_reason(exc) is None
