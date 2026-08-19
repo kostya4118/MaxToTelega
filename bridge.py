@@ -80,6 +80,7 @@ from utils import (
     TG_CAPTION_LIMIT,
     TG_UPLOAD_LIMIT,
     describe_control_event,
+    is_auth_error,
     is_bot_contact,
     looks_like_phone,
     mask_phone,
@@ -2167,6 +2168,9 @@ class Manager:
         # Автоподъём упавших аккаунтов: задачи и те, о ком уже писали владельцу.
         self._revive_tasks: dict[int, asyncio.Task] = {}
         self._down_notified: set[int] = set()
+        # MAX отозвал сессию: поднимать бесполезно, ждём входа по SMS.
+        self._needs_relogin: set[int] = set()
+        self._auth_notified: set[int] = set()
         # Антифлуд: попытки /add и кулдауны «тяжёлых» команд (по монотонным сек).
         self._add_times: dict[int, list[float]] = {}
         self._cmd_times: dict[tuple[int, str], float] = {}
@@ -2351,6 +2355,11 @@ class Manager:
                 f"   /relogin {account_id}\n"
                 f"• Или удали заявку: /remove {account_id}"
             )
+        elif is_auth_error(exc):
+            # Сессия недействительна — перезапуск её не воскресит.
+            logger.error("Аккаунт '%s': MAX отозвал сессию (%r)", name, exc)
+            await self._require_relogin(account_id, name, owner)
+            return
         else:
             # Обрыв связи с MAX — обычное дело; поднимаем сами и молчим,
             # пока попытки не исчерпаны.
@@ -2361,6 +2370,56 @@ class Manager:
             await self.bot.send_message(owner, text)
         except Exception:
             pass
+
+    async def _require_relogin(self, account_id: int, name: str, owner: int) -> None:
+        """Останавливает автоподъём и зовёт владельца войти заново по SMS."""
+        self._needs_relogin.add(account_id)
+        revive = self._revive_tasks.pop(account_id, None)
+        if revive is not None and not revive.done():
+            revive.cancel()
+        await self.registry.set_status(account_id, "auth_failed")
+        if not owner or account_id in self._auth_notified:
+            return
+        self._auth_notified.add(account_id)
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="📲 Войти заново по SMS",
+                callback_data=f"btn:resession:{account_id}",
+            ),
+        ]])
+        try:
+            await self.bot.send_message(
+                owner,
+                f"🔐 MAX разлогинил аккаунт «{name}» — сессия больше "
+                "недействительна.\n\n"
+                "Сообщения не приходят, пока не войдёшь заново. Нажми кнопку, "
+                "когда будешь готов принять SMS-код (он живёт около двух минут).",
+                reply_markup=kb,
+            )
+        except Exception:
+            logger.debug("Не доставить сообщение владельцу %s", owner, exc_info=True)
+
+    async def _reset_session(self, account_id: int) -> None:
+        """Удаляет файл сессии и запускает вход заново — MAX пришлёт SMS."""
+        acc = await self.registry.get(account_id)
+        if acc is None:
+            return
+        await self._cleanup_account(account_id, delete=False)
+        session = acc["session"] or f"acc_{account_id}.db"
+        path = session if os.path.isabs(session) else os.path.join(
+            self.config.work_dir, session
+        )
+        try:
+            os.remove(path)
+            logger.info("Сессия аккаунта #%s удалена: %s", account_id, path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("Не удалить сессию %s", path, exc_info=True)
+        self._needs_relogin.discard(account_id)
+        self._auth_notified.discard(account_id)
+        self.pending_announce.add(account_id)
+        await self._start_account(account_id)
 
     def _schedule_revive(self, account_id: int) -> None:
         """Ставит в очередь автоподъём аккаунта, если он ещё не запущен."""
@@ -2391,6 +2450,8 @@ class Manager:
                 return  # аккаунт удалили, пока мы ждали
             if account_id in self.workers:
                 return  # подняли другим путём (/relogin)
+            if account_id in self._needs_relogin:
+                return  # ждём входа по SMS, поднимать бессмысленно
 
             logger.info("Попытка %d/%d поднять аккаунт #%s",
                         attempt, REVIVE_ATTEMPTS, account_id)
@@ -2433,6 +2494,11 @@ class Manager:
 
     async def _restart_account(self, account_id: int, *, announce: bool) -> None:
         """Останавливает и заново запускает аккаунт (после смены прокси и т.п.)."""
+        if account_id in self._needs_relogin:
+            # Токен отозван — обычный перезапуск снова упрётся в ту же ошибку,
+            # поэтому начинаем вход с нуля, с SMS.
+            await self._reset_session(account_id)
+            return
         await self._cleanup_account(account_id, delete=False)
         if announce:
             self.pending_announce.add(account_id)
@@ -3216,6 +3282,8 @@ class Manager:
     async def _check_connections(self) -> None:
         now = time.monotonic()
         for worker in list(self.workers.values()):
+            if worker.account_id in self._needs_relogin:
+                continue
             if worker._max_online():
                 if worker.offline_since is None:
                     continue
@@ -3700,6 +3768,22 @@ class Manager:
                 return
             await cb.answer("Перезапускаю…")
             await self._restart_account(account_id, announce=True)
+
+        elif action == "resession" and len(parts) > 2 and parts[2].isdigit():
+            account_id = int(parts[2])
+            acc = await self.registry.get(account_id)
+            if acc is None or acc["owner_tg_id"] != tg:
+                await cb.answer("Нет такого аккаунта.", show_alert=True)
+                return
+            await cb.answer("Запрашиваю новый вход…")
+            try:
+                await cb.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            await cb.message.answer(
+                "📲 Запускаю вход в MAX. Сейчас придёт SMS — пришли код сюда."
+            )
+            await self._reset_session(account_id)
 
         elif action in ("proxy_sub", "proxy_unsub"):
             await cb.answer()

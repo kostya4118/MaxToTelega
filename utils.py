@@ -229,3 +229,20 @@ def tg_proxy_web_link(link: str) -> str | None:
     if link and link.startswith(prefix):
         return "https://t.me/proxy?" + link[len(prefix):]
     return None
+
+
+# Признаки того, что MAX отозвал сессию: переподключение тут не поможет,
+# нужен новый вход по SMS.
+_AUTH_ERROR_MARKERS = (
+    "login.token",
+    "fail_login_token",
+    "auth.token",
+    "not.authorized",
+    "unauthorized",
+)
+
+
+def is_auth_error(exc: object) -> bool:
+    """Отличает «сессия недействительна» от обычного обрыва связи."""
+    text = str(exc or "").lower()
+    return any(marker in text for marker in _AUTH_ERROR_MARKERS)

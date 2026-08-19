@@ -3,6 +3,7 @@ import pytest
 from utils import (
     MAX_LINK_RE,
     describe_control_event,
+    is_auth_error,
     is_bot_contact,
     mask_phone,
     normalize_phone,
@@ -230,3 +231,23 @@ class TestProxyLink:
     ])
     def test_web_variant_only_for_tg_scheme(self, link):
         assert tg_proxy_web_link(link) is None
+
+
+class TestAuthError:
+    def test_detects_fail_login_token(self):
+        # Ровно то, что MAX присылает после отзыва сессии.
+        exc = (
+            "Ошибка входа. Пожалуйста, авторизируйтесь снова FAIL_LOGIN_TOKEN "
+            "(Ошибка входа) [login.token]"
+        )
+        assert is_auth_error(exc) is True
+
+    @pytest.mark.parametrize("exc", [
+        "Connection closed by the server",
+        "[Errno 110] Connection timed out",
+        "Must be ONLINE session",
+        "",
+        None,
+    ])
+    def test_network_errors_are_not_auth(self, exc):
+        assert is_auth_error(exc) is False
