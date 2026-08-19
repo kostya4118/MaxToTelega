@@ -174,6 +174,7 @@ AUTH_TIMEOUT = 300  # сек на ввод кода/пароля
 WATCHDOG_INTERVAL = 30  # как часто проверяем связь аккаунтов с MAX
 OFFLINE_ALERT_SEC = 300  # через сколько молчания предупредить владельца
 OFFLINE_RESTART_SEC = 180  # через сколько молчания перезапускать аккаунт
+CLIENT_STOP_TIMEOUT = 10  # сколько ждём закрытия сессии MAX при остановке
 # Паузы между попытками поднять упавший аккаунт (последняя повторяется).
 REVIVE_DELAYS = (15, 30, 60, 300, 900)
 REVIVE_ATTEMPTS = 6  # после стольких неудач зовём владельца на /relogin
@@ -2514,8 +2515,13 @@ class Manager:
         if task and not task.done():
             task.cancel()
             try:
-                await task  # дождёмся закрытия сессии MAX перед удалением файлов
-            except (asyncio.CancelledError, Exception):
+                # Ждём закрытия сессии MAX, но не вечно: клиент, застрявший
+                # в попытках логина, иначе подвешивает остановку сервиса.
+                await asyncio.wait_for(asyncio.shield(task), CLIENT_STOP_TIMEOUT)
+            except (TimeoutError, asyncio.CancelledError):
+                logger.debug("Клиент #%s не завершился за %s сек",
+                             account_id, CLIENT_STOP_TIMEOUT)
+            except Exception:
                 pass
         worker = self.workers.pop(account_id, None)
         if worker is not None:
@@ -4137,10 +4143,11 @@ class Manager:
         finally:
             backup_task.cancel()
             watchdog_task.cancel()
-            for task in list(self.tasks.values()):
+            background = [*self._revive_tasks.values(), *self._followups]
+            for task in [*self.tasks.values(), *background]:
                 task.cancel()
             await asyncio.gather(
-                backup_task, watchdog_task, *self.tasks.values(),
+                backup_task, watchdog_task, *self.tasks.values(), *background,
                 return_exceptions=True,
             )
             await self.http.close()

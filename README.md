@@ -130,6 +130,8 @@ WorkingDirectory=/opt/maxtotelega/app
 ExecStart=/opt/maxtotelega/app/.venv/bin/python -u bridge.py
 Restart=always
 RestartSec=10
+# Клиент MAX может застрять в попытках логина — не ждём его вечно
+TimeoutStopSec=30
 MemoryMax=400M
 NoNewPrivileges=true
 PrivateTmp=true
