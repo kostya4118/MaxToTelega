@@ -666,6 +666,14 @@ class Account:
             await self._apply_reaction(message.id, counters, total)
             return
 
+        # Одно и то же сообщение может прийти дважды: MAX повторяет событие
+        # или рядом живёт второй клиент этого аккаунта. Уже пересланное
+        # узнаём по карте сообщений и второй раз не постим.
+        if message.id is not None and await self.storage.get_msg_map(message.id):
+            logger.info("[%s] сообщение %s уже переслано — пропускаю",
+                        self.name, message.id)
+            return
+
         dest = self.group_id
         chat = await self._get_chat(message.chat_id)
         is_group = chat is not None and chat.type != ChatType.DIALOG
