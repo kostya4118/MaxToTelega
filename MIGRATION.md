@@ -120,17 +120,25 @@ MAX на каждый номер — сообщения придут в те ж�
 crontab -l | grep -v start-mtproxy | crontab -
 ```
 
-На новом сервере ставим docker и скрипт, затем прописываем два пути:
+Скрипт ротации лежит в этом же репозитории — `scripts/start-mtproxy.sh`.
+Отдельно качать ничего не нужно:
 
 ```bash
-sed -i 's#^SUBS_FILE=.*#SUBS_FILE="/opt/maxtotelega/app/data/proxy_subscribers.txt"#' \
-  /root/start-mtproxy.sh
-grep -n 'SUBS_FILE\|BRIDGE_COPY' /root/start-mtproxy.sh
+curl -fsSL https://get.docker.com | sh
+apt install -y xxd || apt install -y vim-common
+ln -sf /opt/maxtotelega/app/scripts/start-mtproxy.sh /root/start-mtproxy.sh
 ```
 
-`SUBS_FILE` — кого оповещать, `BRIDGE_COPY` — куда положить `mtproto_config.txt`,
-чтобы кнопка «📡 MTProto прокси» в боте отдавала актуальную ссылку. Оба должны
-указывать в `data/` моста.
+Пути к данным моста скрипт берёт сам: подписчиков из
+`data/proxy_subscribers.txt`, копию конфига кладёт в `data/mtproto_config.txt`
+(из неё кнопка «📡 MTProto прокси» в боте отдаёт актуальную ссылку). Токен
+бота читается из `.env` моста — в самом скрипте его нет и быть не должно.
+
+Если мост стоит не в `/opt/maxtotelega/app`, укажи каталог:
+
+```bash
+BRIDGE_DIR=/путь/к/мосту bash /root/start-mtproxy.sh
+```
 
 Запускаем и смотрим, что ссылки ушли:
 
@@ -163,10 +171,10 @@ chmod 644 /etc/mtproto-zig/config.toml
 docker restart mtproto-proxy
 ```
 
-Чтобы не повторялось при каждой ротации, поправь и сам скрипт — в нём
-`chmod 600 "$CONFIG"` меняется на `chmod 644 "$CONFIG"`. Права на файл
-секрета (`chmod 600 "$SECRET_FILE"`) трогать не нужно: его читает только
-скрипт.
+В `scripts/start-mtproxy.sh` это уже исправлено. Если используешь свою копию
+скрипта — замени в ней `chmod 600 "$CONFIG"` на `chmod 644 "$CONFIG"`. Права
+на файл секрета (`chmod 600 "$SECRET_FILE"`) трогать не нужно: его читает
+только скрипт.
 
 ## Откат
 
